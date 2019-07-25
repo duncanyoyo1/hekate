@@ -19,6 +19,7 @@
 #include "../gfx/di.h"
 #include "../power/max77620.h"
 #include "../rtc/max77620-rtc.h"
+#include "../soc/bpmp.h"
 #include "../soc/i2c.h"
 #include "../soc/pmc.h"
 #include "../soc/t210.h"
@@ -78,6 +79,8 @@ void panic(u32 val)
 
 void reboot_normal()
 {
+	bpmp_mmu_disable();
+
 	sd_unmount();
 	display_end();
 
@@ -86,6 +89,8 @@ void reboot_normal()
 
 void reboot_rcm()
 {
+	bpmp_mmu_disable();
+
 	sd_unmount();
 	display_end();
 
@@ -103,20 +108,5 @@ void power_off()
 	// Stop the alarm, in case we injected and powered off too fast.
 	max77620_rtc_stop_alarm();
 
-	//TODO: we should probably make sure all regulators are powered off properly.
 	i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, MAX77620_REG_ONOFFCNFG1, MAX77620_ONOFFCNFG1_PWR_OFF);
-}
-
-#define CRC32C_POLY 0x82F63B78
-u32 crc32c(const void *buf, u32 len)
-{
-	const u8 *cbuf = (const u8 *)buf;
-	u32 crc = 0xFFFFFFFF;
-	while (len--)
-	{
-		crc ^= *cbuf++;
-		for (int i = 0; i < 8; i++)
-			crc = crc & 1 ? (crc >> 1) ^ CRC32C_POLY : crc >> 1;
-	}
-	return ~crc;
 }

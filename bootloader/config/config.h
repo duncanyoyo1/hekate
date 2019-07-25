@@ -29,12 +29,16 @@ typedef struct _hekate_config
 	u32 backlight;
 	u32 autohosoff;
 	u32 autonogc;
+	char *brand;
+	char *tagline;
 	// Global temporary config.
 	bool se_keygen_done;
 	u32 sbar_time_keeping;
 	u32 errors;
 	int sept_run;
 	bool rcm_patched;
+	u32 sd_timeoff;
+	bool emummc_force_disable;
 } hekate_config;
 
 typedef enum

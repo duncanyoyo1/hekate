@@ -31,7 +31,8 @@
 #define KB_FIRMWARE_VERSION_600 5
 #define KB_FIRMWARE_VERSION_620 6
 #define KB_FIRMWARE_VERSION_700 7
-#define KB_FIRMWARE_VERSION_MAX KB_FIRMWARE_VERSION_700
+#define KB_FIRMWARE_VERSION_810 8
+#define KB_FIRMWARE_VERSION_MAX KB_FIRMWARE_VERSION_810
 
 #define HOS_PKG11_MAGIC 0x31314B50
 
@@ -51,6 +52,7 @@ typedef struct _launch_ctxt_t
 	void *pkg2;
 	u32   pkg2_size;
 
+	bool   new_pkg2;
 	void  *kernel;
 	u32    kernel_size;
 	link_t kip1_list;
@@ -60,6 +62,7 @@ typedef struct _launch_ctxt_t
 	bool debugmode;
 	bool stock;
 	bool atmosphere;
+	bool emuMMC;
 
 	ini_sec_t *cfg;
 } launch_ctxt_t;
@@ -71,6 +74,6 @@ typedef struct _merge_kip_t
 } merge_kip_t;
 
 int hos_launch(ini_sec_t *cfg);
-int keygen(u8 *keyblob, u32 kb, tsec_ctxt_t *tsec_ctxt);
+int keygen(u8 *keyblob, u32 kb, tsec_ctxt_t *tsec_ctxt, launch_ctxt_t *hos_ctxt);
 
 #endif

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (C) 2018 CTCaer
+ * Copyright (C) 2018-2019 CTCaer
  * Copyright (C) 2018 M4xw
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -26,6 +26,8 @@
 #define WPRINTF(text) gfx_printf("%k"text"%k\n", 0xFFFFDD00, 0xFFCCCCCC)
 #define WPRINTFARGS(text, args...) gfx_printf("%k"text"%k\n", 0xFFFFDD00, args, 0xFFCCCCCC)
 
+#define FB_ADDRESS 0xC0000000
+
 void gfx_init_ctxt(u32 *fb, u32 width, u32 height, u32 stride);
 void gfx_clear_grey(u8 color);
 void gfx_clear_partial_grey(u8 color, u32 pos_x, u32 height);
@@ -41,8 +43,8 @@ void gfx_hexdump(u32 base, const u8 *buf, u32 len);
 
 void gfx_set_pixel(u32 x, u32 y, u32 color);
 void gfx_line(int x0, int y0, int x1, int y1, u32 color);
-void gfx_put_small_sep(gfx_con_t *con);
-void gfx_put_big_sep(gfx_con_t *con);
+void gfx_put_small_sep();
+void gfx_put_big_sep();
 void gfx_set_rect_grey(const u8 *buf, u32 size_x, u32 size_y, u32 pos_x, u32 pos_y);
 void gfx_set_rect_rgb(const u8 *buf, u32 size_x, u32 size_y, u32 pos_x, u32 pos_y);
 void gfx_set_rect_argb(const u32 *buf, u32 size_x, u32 size_y, u32 pos_x, u32 pos_y);

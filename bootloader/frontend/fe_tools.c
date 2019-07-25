@@ -45,10 +45,15 @@ extern void sd_unmount();
 extern int  sd_save_to_file(void *buf, u32 size, const char *filename);
 extern void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
 
+#pragma GCC push_options
+#pragma GCC optimize ("Os")
+
 void dump_packages12()
 {
 	if (!sd_mount())
 		return;
+
+	char path[64];
 
 	u8 *pkg1 = (u8 *)calloc(1, 0x40000);
 	u8 *warmboot = (u8 *)calloc(1, 0x40000);
@@ -74,17 +79,22 @@ void dump_packages12()
 	// Read package1.
 	sdmmc_storage_read(&storage, 0x100000 / NX_EMMC_BLOCKSIZE, 0x40000 / NX_EMMC_BLOCKSIZE, pkg1);
 	const pkg1_id_t *pkg1_id = pkg1_identify(pkg1);
-	const pk11_hdr_t *hdr = (pk11_hdr_t *)(pkg1 + pkg1_id->pkg11_off + 0x20);
 	if (!pkg1_id)
 	{
-		gfx_con.fntsz = 8;
 		EPRINTF("Unknown pkg1 version for reading\nTSEC firmware.");
+		// Dump package1.
+		emmcsn_path_impl(path, "/pkg1", "pkg1_enc.bin", &storage);
+		if (sd_save_to_file(pkg1, 0x40000, path))
+			goto out_free;
+		gfx_puts("\nEnc pkg1 dumped to pkg1_enc.bin\n");
+
 		goto out_free;
 	}
+	const pk11_hdr_t *hdr = (pk11_hdr_t *)(pkg1 + pkg1_id->pkg11_off + 0x20);
 
 	kb = pkg1_id->kb;
 
-	if (!h_cfg.se_keygen_done || kb == KB_FIRMWARE_VERSION_620)
+	if (!h_cfg.se_keygen_done)
 	{
 		tsec_ctxt.fw = (void *)pkg1 + pkg1_id->tsec_off;
 		tsec_ctxt.pkg1 = (void *)pkg1;
@@ -99,7 +109,7 @@ void dump_packages12()
 			gfx_printf("sept will run to get the keys.\nThen rerun this option.");
 			btn_wait();
 
-			if (!reboot_to_sept((u8 *)tsec_ctxt.fw))
+			if (!reboot_to_sept((u8 *)tsec_ctxt.fw, kb))
 			{
 				gfx_printf("Failed to run sept\n");
 				goto out_free;
@@ -111,16 +121,14 @@ void dump_packages12()
 		sdmmc_storage_read(&storage, 0x180000 / NX_EMMC_BLOCKSIZE + kb, 1, keyblob);
 
 		// Decrypt.
-		keygen(keyblob, kb, &tsec_ctxt);
-
-		h_cfg.se_keygen_done = 1;
+		keygen(keyblob, kb, &tsec_ctxt, NULL);
+		if (kb <= KB_FIRMWARE_VERSION_600)
+			h_cfg.se_keygen_done = 1;
 		free(keyblob);
 	}
 
 	if (kb <= KB_FIRMWARE_VERSION_600)
 		pkg1_decrypt(pkg1_id, pkg1);
-
-	char path[64];
 
 	if (kb <= KB_FIRMWARE_VERSION_620)
 	{
@@ -183,10 +191,13 @@ void dump_packages12()
 		pkg2_size_aligned / NX_EMMC_BLOCKSIZE, pkg2);
 	// Decrypt package2 and parse KIP1 blobs in INI1 section.
 	pkg2_hdr_t *pkg2_hdr = pkg2_decrypt(pkg2);
+	if (!pkg2_hdr)
+	{
+		gfx_printf("Pkg2 decryption failed!\n");
+		goto out;
+	}
 
 	// Display info.
-	u32 kernel_crc32 = crc32c(pkg2_hdr->data, pkg2_hdr->sec_size[PKG2_SEC_KERNEL]);
-	gfx_printf("\n%kKernel CRC32C: %k0x%08X\n\n", 0xFFC7EA46, 0xFFCCCCCC, kernel_crc32);
 	gfx_printf("%kKernel size:   %k0x%05X\n\n", 0xFFC7EA46, 0xFFCCCCCC, pkg2_hdr->sec_size[PKG2_SEC_KERNEL]);
 	gfx_printf("%kINI1 size:     %k0x%05X\n\n", 0xFFC7EA46, 0xFFCCCCCC, pkg2_hdr->sec_size[PKG2_SEC_INI1]);
 
@@ -204,8 +215,14 @@ void dump_packages12()
 
 	// Dump INI1.
 	emmcsn_path_impl(path, "/pkg2", "ini1.bin", &storage);
-	if (sd_save_to_file(pkg2_hdr->data + pkg2_hdr->sec_size[PKG2_SEC_KERNEL],
-		pkg2_hdr->sec_size[PKG2_SEC_INI1], path))
+	u32 ini1_off = pkg2_hdr->sec_size[PKG2_SEC_KERNEL];
+	u32 ini1_size = pkg2_hdr->sec_size[PKG2_SEC_INI1];
+	if (!ini1_size)
+	{
+		ini1_off = *(u32 *)(pkg2_hdr->data + PKG2_NEWKERN_INI1_START);
+		ini1_size = *(u32 *)(pkg2_hdr->data + PKG2_NEWKERN_INI1_END) - *(u32 *)(pkg2_hdr->data + PKG2_NEWKERN_INI1_START);
+	}
+	if (sd_save_to_file(pkg2_hdr->data + ini1_off, ini1_size, path))
 		goto out;
 	gfx_puts("INI1 dumped to ini1.bin\n");
 
@@ -582,60 +599,4 @@ void fix_sd_nin_attr() { _fix_sd_attr(1); }
 	}
 }*/
 
-/*
-#include "../../modules/hekate_libsys_minerva/mtc.h"
-#include "../ianos/ianos.h"
-#include "../soc/fuse.h"
-#include "../soc/clock.h"
-
-void minerva()
-{
-	gfx_clear_partial_grey(0x1B, 0, 1256);
-	gfx_con_setpos(0, 0);
-
-	u32 curr_ram_idx = 0;
-
-	if (!sd_mount())
-		return;
-
-	gfx_printf("-- Minerva Training Cell --\n\n");
-
-	// Set table to ram.
-	mtc_cfg.mtc_table = NULL;
-	mtc_cfg.sdram_id = (fuse_read_odm(4) >> 3) & 0x1F;
-	ianos_loader(false, "bootloader/sys/libsys_minerva.bso", DRAM_LIB, (void *)&mtc_cfg);
-
-	gfx_printf("\nStarting training process..\n\n");
-
-	// Get current frequency
-	for (curr_ram_idx = 0; curr_ram_idx < 10; curr_ram_idx++)
-	{
-		if (CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_EMC) == mtc_cfg.mtc_table[curr_ram_idx].clk_src_emc)
-			break;
-	}
-
-	// Change DRAM voltage.
-	//i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, MAX77620_REG_SD1, 42); //40 = (1000 * 1100 - 600000) / 12500 -> 1.1V
-
-	mtc_cfg.rate_from = mtc_cfg.mtc_table[curr_ram_idx].rate_khz;
-	mtc_cfg.rate_to = 800000;
-	mtc_cfg.train_mode = OP_TRAIN_SWITCH;
-	gfx_printf("Training and switching %7d -> %7d\n\n", mtc_cfg.mtc_table[curr_ram_idx].rate_khz, 800000);
-	ianos_loader(false, "bootloader/sys/libsys_minerva.bso", DRAM_LIB, (void *)&mtc_cfg);
-	
-	// Thefollowing frequency needs periodic training every 100ms.
-	//msleep(200);
-
-	//mtc_cfg.rate_to = 1600000;
-	//gfx_printf("Training and switching  %7d -> %7d\n\n", mtc_cfg.current_emc_table->rate_khz, 1600000);
-	//ianos_loader(false, "bootloader/sys/libsys_minerva.bso", DRAM_LIB, (void *)&mtc_cfg);
-
-	//mtc_cfg.train_mode = OP_PERIODIC_TRAIN;
-	
-	sd_unmount();
-	
-	gfx_printf("Finished!");
-
-	btn_wait();
-}
-*/
+#pragma GCC pop_options

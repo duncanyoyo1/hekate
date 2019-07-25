@@ -36,6 +36,8 @@
 #define MIXD_BUF_ALIGNED 0xB7000000
 
 #define NUM_SECTORS_PER_ITER 8192 // 4MB Cache.
+#define OUT_FILENAME_SZ 128
+#define SHA256_SZ 0x20
 
 extern sdmmc_t sd_sdmmc;
 extern sdmmc_storage_t sd_storage;
@@ -46,6 +48,9 @@ extern bool sd_mount();
 extern void sd_unmount();
 extern void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
 
+#pragma GCC push_options
+#pragma GCC optimize ("Os")
+
 static int _dump_emmc_verify(sdmmc_storage_t *storage, u32 lba_curr, char *outFilename, emmc_part_t *part)
 {
 	FIL fp;
@@ -55,8 +60,8 @@ static int _dump_emmc_verify(sdmmc_storage_t *storage, u32 lba_curr, char *outFi
 	u32 sdFileSector = 0;
 	int res = 0;
 
-	u8 hashEm[0x20];
-	u8 hashSd[0x20];
+	u8 hashEm[SHA256_SZ];
+	u8 hashSd[SHA256_SZ];
 
 	if (f_open(&fp, outFilename, FA_READ) == FR_OK)
 	{
@@ -76,7 +81,7 @@ static int _dump_emmc_verify(sdmmc_storage_t *storage, u32 lba_curr, char *outFi
 			// Check every time or every 4.
 			// Every 4 protects from fake sd, sector corruption and frequent I/O corruption.
 			// Full provides all that, plus protection from extremely rare I/O corruption.
-			if ((h_cfg.verification & 2) || !(sparseShouldVerify % 4))
+			if ((h_cfg.verification >= 2) || !(sparseShouldVerify % 4))
 			{
 				if (!sdmmc_storage_read(storage, lba_curr, num, bufEm))
 				{
@@ -150,7 +155,7 @@ static int _dump_emmc_verify(sdmmc_storage_t *storage, u32 lba_curr, char *outFi
 	}
 }
 
-void _update_filename(char *outFilename, u32 sdPathLen, u32 numSplitParts, u32 currPartIdx)
+static void _update_filename(char *outFilename, u32 sdPathLen, u32 numSplitParts, u32 currPartIdx)
 {
 	if (numSplitParts >= 10 && currPartIdx < 10)
 	{
@@ -235,7 +240,7 @@ static int _dump_emmc_part(char *sd_path, sdmmc_storage_t *storage, emmc_part_t 
 		gfx_printf("%kPartial Backup enabled (with %d MiB parts)...%k\n\n", 0xFFFFBA00, multipartSplitSize >> 20, 0xFFCCCCCC);
 
 	// Check if filesystem is FAT32 or the free space is smaller and backup in parts.
-	if (((sd_fs.fs_type != FS_EXFAT) && totalSectors > (FAT32_FILESIZE_LIMIT / NX_EMMC_BLOCKSIZE)) | isSmallSdCard)
+	if (((sd_fs.fs_type != FS_EXFAT) && totalSectors > (FAT32_FILESIZE_LIMIT / NX_EMMC_BLOCKSIZE)) || isSmallSdCard)
 	{
 		u32 multipartSplitSectors = multipartSplitSize / NX_EMMC_BLOCKSIZE;
 		numSplitParts = (totalSectors + multipartSplitSectors - 1) / multipartSplitSectors;
@@ -361,6 +366,7 @@ static int _dump_emmc_part(char *sd_path, sdmmc_storage_t *storage, emmc_part_t 
 
 				return 0;
 			}
+
 			bytesWritten = 0;
 
 			totalSize = (u64)((u64)totalSectors << 9);
@@ -496,7 +502,7 @@ static void _dump_emmc_selected(emmcPartType_t dumpType)
 	}
 
 	int i = 0;
-	char sdPath[80];
+	char sdPath[OUT_FILENAME_SZ];
 	// Create Restore folders, if they do not exist.
 	emmcsn_path_impl(sdPath, "/restore", "", &storage);
 	emmcsn_path_impl(sdPath, "/restore/partitions", "", &storage);
@@ -612,7 +618,7 @@ static int _restore_emmc_part(char *sd_path, sdmmc_storage_t *storage, emmc_part
 
 	gfx_con_getpos(&gfx_con.savedx, &gfx_con.savedy);
 
-    bool use_multipart = false;
+	bool use_multipart = false;
 
 	if (allow_multi_part)
 	{
@@ -855,7 +861,7 @@ static void _restore_emmc_selected(emmcPartType_t restoreType)
 	}
 
 	int i = 0;
-	char sdPath[80];
+	char sdPath[OUT_FILENAME_SZ];
 
 	timer = get_tmr_s();
 	if (restoreType & PART_BOOT)
@@ -935,3 +941,5 @@ out:
 void restore_emmc_boot()      { _restore_emmc_selected(PART_BOOT); }
 void restore_emmc_rawnand()   { _restore_emmc_selected(PART_RAW); }
 void restore_emmc_gpp_parts() { _restore_emmc_selected(PART_GP_ALL); }
+
+#pragma GCC pop_options
