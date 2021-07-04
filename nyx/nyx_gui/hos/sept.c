@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 CTCaer
+ * Copyright (c) 2019-2021 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,21 +18,22 @@
 
 #include "hos.h"
 #include "sept.h"
-#include "../config/config.h"
-#include "../gfx/di.h"
-#include "../ianos/ianos.h"
-#include "../libs/fatfs/ff.h"
-#include "../mem/heap.h"
-#include "../soc/hw_init.h"
-#include "../soc/pmc.h"
-#include "../soc/t210.h"
+#include "../config.h"
+#include <display/di.h>
+#include <ianos/ianos.h>
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <soc/hw_init.h>
+#include <soc/pmc.h>
+#include <soc/t210.h>
 #include "../storage/nx_emmc.h"
-#include "../storage/sdmmc.h"
-#include "../utils/btn.h"
-#include "../utils/types.h"
-#include "../utils/util.h"
+#include <storage/nx_sd.h>
+#include <storage/sdmmc.h>
+#include <utils/btn.h>
+#include <utils/types.h>
+#include <utils/util.h>
 
-#include "../gfx/gfx.h"
+#include <gfx_utils.h>
 
 #define RELOC_META_OFF   0x7C
 #define PATCHED_RELOC_SZ 0x94
@@ -44,7 +45,7 @@ u8 warmboot_reboot[] = {
 	0x14, 0x00, 0x9F, 0xE5, // LDR R0, =0x7000E450
 	0x01, 0x10, 0xB0, 0xE3, // MOVS R1, #1
 	0x00, 0x10, 0x80, 0xE5, // STR R1, [R0]
-	0x0C, 0x00, 0x9F, 0xE5, // LDR R0, =0x7000E400 
+	0x0C, 0x00, 0x9F, 0xE5, // LDR R0, =0x7000E400
 	0x10, 0x10, 0xB0, 0xE3, // MOVS R1, #0x10
 	0x00, 0x10, 0x80, 0xE5, // STR R1, [R0]
 	0xFE, 0xFF, 0xFF, 0xEA, // LOOP
@@ -64,55 +65,8 @@ extern volatile boot_cfg_t *b_cfg;
 extern hekate_config h_cfg;
 extern volatile nyx_storage_t *nyx_str;
 
-extern void *sd_file_read(char *path);
-extern void sd_mount();
-extern void sd_unmount(bool deinit);
 extern bool is_ipl_updated(void *buf);
 extern void reloc_patcher(u32 payload_dst, u32 payload_src, u32 payload_size);
-
-void check_sept()
-{
-	// Check if non-hekate payload is used for sept and restore it.
-	if (h_cfg.sept_run && !f_stat("sept/payload.bak", NULL))
-	{
-		f_unlink("sept/payload.bin");
-		f_rename("sept/payload.bak", "sept/payload.bin");
-		return;
-	}
-
-	u8 *pkg1 = (u8 *)calloc(1, 0x40000);
-
-	sdmmc_storage_t storage;
-	sdmmc_t sdmmc;
-	if (!sdmmc_storage_init_mmc(&storage, &sdmmc, SDMMC_4, SDMMC_BUS_WIDTH_8, 4))
-	{
-		EPRINTF("Failed to init eMMC.");
-		goto out_free;
-	}
-	sdmmc_storage_set_mmc_partition(&storage, 1);
-
-	// Read package1.
-	char *build_date = malloc(32);
-	sdmmc_storage_read(&storage, 0x100000 / NX_EMMC_BLOCKSIZE, 0x40000 / NX_EMMC_BLOCKSIZE, pkg1);
-	const pkg1_id_t *pkg1_id = pkg1_identify(pkg1, build_date);
-	free(build_date);
-	if (!pkg1_id)
-	{
-		gfx_con.fntsz = 16;
-		EPRINTF("Unknown pkg1 version.");
-		goto out_free;
-	}
-
-	if (pkg1_id->kb >= KB_FIRMWARE_VERSION_700 && !h_cfg.sept_run)
-	{
-		sdmmc_storage_end(&storage);
-		reboot_to_sept((u8 *)pkg1 + pkg1_id->tsec_off, pkg1_id->kb);
-	}
-
-out_free:
-	free(pkg1);
-	sdmmc_storage_end(&storage);
-}
 
 int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 {
@@ -125,7 +79,7 @@ int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 	memcpy((u8 *)(SEPT_PK1T_ADDR - WB_RST_SIZE), (u8 *)warmboot_reboot, sizeof(warmboot_reboot));
 	memcpy((void *)SEPT_PK1T_ADDR, tsec_fw, tsec_fw_size);
 	*(vu32 *)SEPT_TCSZ_ADDR = tsec_fw_size;
-	
+
 	// Copy sept-primary.
 	if (f_open(&fp, "sept/sept-primary.bin", FA_READ))
 		goto error;
@@ -141,8 +95,7 @@ int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 	if (kb < KB_FIRMWARE_VERSION_810)
 	{
 		if (f_open(&fp, "sept/sept-secondary_00.enc", FA_READ))
-			if (f_open(&fp, "sept/sept-secondary.enc", FA_READ)) // Try the deprecated version.
-				goto error;
+			goto error;
 	}
 	else
 	{
@@ -158,7 +111,6 @@ int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 	f_close(&fp);
 
 	b_cfg->boot_cfg |= (BOOT_CFG_AUTOBOOT_EN | BOOT_CFG_SEPT_RUN);
-	b_cfg->extra_cfg = EXTRA_CFG_NYX_DUMP;
 
 	bool update_sept_payload = true;
 	if (!f_open(&fp, "sept/payload.bin", FA_READ | FA_WRITE))
@@ -178,25 +130,28 @@ int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 				memcpy(tmp_cfg, (boot_cfg_t *)b_cfg, sizeof(boot_cfg_t));
 				f_lseek(&fp, PATCHED_RELOC_SZ);
 				f_write(&fp, tmp_cfg, sizeof(boot_cfg_t), NULL);
-				f_close(&fp);
 				update_sept_payload = false;
 			}
+
+			f_close(&fp);
 		}
 		else
+		{
+			f_close(&fp);
 			f_rename("sept/payload.bin", "sept/payload.bak"); // Backup foreign payload.
-
-		f_close(&fp);
+		}
 	}
 
 	if (update_sept_payload)
 	{
 		volatile reloc_meta_t *reloc = (reloc_meta_t *)(nyx_str->hekate + RELOC_META_OFF);
+		f_mkdir("sept");
 		f_open(&fp, "sept/payload.bin", FA_WRITE | FA_CREATE_ALWAYS);
 		f_write(&fp, (u8 *)nyx_str->hekate, reloc->end - reloc->start, NULL);
 		f_close(&fp);
 	}
 
-	sd_unmount(true);
+	sd_end();
 
 	u32 pk1t_sept = SEPT_PK1T_ADDR - (ALIGN(PATCHED_RELOC_SZ, 0x10) + WB_RST_SIZE);
 
@@ -211,7 +166,7 @@ int reboot_to_sept(const u8 *tsec_fw, u32 kb)
 	PMC(APBDEV_PMC_SCRATCH33) = SEPT_PRI_ADDR;
 	PMC(APBDEV_PMC_SCRATCH40) = 0x6000F208;
 
-	reconfig_hw_workaround(false, 0);
+	hw_reinit_workaround(false, 0);
 
 	(*sept)();
 

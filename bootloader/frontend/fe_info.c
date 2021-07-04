@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (c) 2018-2019 CTCaer
+ * Copyright (c) 2018-2021 CTCaer
  * Copyright (c) 2018 balika011
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -19,60 +19,49 @@
 #include <string.h>
 
 #include "fe_info.h"
-#include "../gfx/gfx.h"
+#include <gfx_utils.h>
 #include "../hos/hos.h"
 #include "../hos/pkg1.h"
-#include "../libs/fatfs/ff.h"
-#include "../mem/heap.h"
-#include "../power/bq24193.h"
-#include "../power/max17050.h"
-#include "../sec/tsec.h"
-#include "../soc/fuse.h"
-#include "../soc/i2c.h"
-#include "../soc/kfuse.h"
-#include "../soc/smmu.h"
-#include "../soc/t210.h"
-#include "../storage/mmc.h"
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <mem/smmu.h>
+#include <power/bq24193.h>
+#include <power/max17050.h>
+#include <sec/se_t210.h>
+#include <sec/tsec.h>
+#include <soc/fuse.h>
+#include <soc/i2c.h>
+#include <soc/kfuse.h>
+#include <soc/t210.h>
+#include <storage/mmc.h>
 #include "../storage/nx_emmc.h"
-#include "../storage/sdmmc.h"
-#include "../utils/btn.h"
-#include "../utils/util.h"
+#include <storage/nx_sd.h>
+#include <storage/sdmmc.h>
+#include <utils/btn.h>
+#include <utils/util.h>
 
-extern sdmmc_storage_t sd_storage;
-extern FATFS sd_fs;
-
-extern bool sd_mount();
-extern void sd_unmount();
-extern int  sd_save_to_file(void *buf, u32 size, const char *filename);
 extern void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
 
 #pragma GCC push_options
-#pragma GCC optimize ("Os") 
+#pragma GCC optimize ("Os")
 
 void print_fuseinfo()
 {
 	gfx_clear_partial_grey(0x1B, 0, 1256);
 	gfx_con_setpos(0, 0);
 
-	u32 burntFuses = 0;
-	for (u32 i = 0; i < 32; i++)
-	{
-		if ((fuse_read_odm(7) >> i) & 1)
-			burntFuses++;
-	}
-
 	gfx_printf("\nSKU:         %X - ", FUSE(FUSE_SKU_INFO));
-	switch (fuse_read_odm(4) & 3)
+	switch (fuse_read_hw_state())
 	{
-	case 0:
+	case FUSE_NX_HW_STATE_PROD:
 		gfx_printf("Retail\n");
 		break;
-	case 3:
+	case FUSE_NX_HW_STATE_DEV:
 		gfx_printf("Dev\n");
 		break;
 	}
-	gfx_printf("Sdram ID:    %d\n", (fuse_read_odm(4) >> 3) & 0x1F);
-	gfx_printf("Burnt fuses: %d / 64\n", burntFuses);
+	gfx_printf("Sdram ID:    %d\n", fuse_read_dramid(true));
+	gfx_printf("Burnt fuses: %d / 64\n", bit_count(fuse_read_odm(7)));
 	gfx_printf("Secure key:  %08X%08X%08X%08X\n\n\n",
 		byte_swap_32(FUSE(FUSE_PRIVATE_KEY0)), byte_swap_32(FUSE(FUSE_PRIVATE_KEY1)),
 		byte_swap_32(FUSE(FUSE_PRIVATE_KEY2)), byte_swap_32(FUSE(FUSE_PRIVATE_KEY3)));
@@ -98,7 +87,7 @@ void print_fuseinfo()
 			if (!sd_save_to_file((u8 *)words, sizeof(words), path))
 				gfx_puts("\nfuse_array_raw.bin saved!\n");
 
-			sd_unmount();
+			sd_end();
 		}
 
 		btn_wait();
@@ -128,7 +117,7 @@ void print_kfuseinfo()
 			emmcsn_path_impl(path, "/dumps", "kfuses.bin", NULL);
 			if (!sd_save_to_file((u8 *)buf, KFUSE_NUM_WORDS * 4, path))
 				gfx_puts("\nDone!\n");
-			sd_unmount();
+			sd_end();
 		}
 
 		btn_wait();
@@ -142,10 +131,7 @@ void print_mmc_info()
 
 	static const u32 SECTORS_TO_MIB_COEFF = 11;
 
-	sdmmc_storage_t storage;
-	sdmmc_t sdmmc;
-
-	if (!sdmmc_storage_init_mmc(&storage, &sdmmc, SDMMC_4, SDMMC_BUS_WIDTH_8, 4))
+	if (!sdmmc_storage_init_mmc(&emmc_storage, &emmc_sdmmc, SDMMC_BUS_WIDTH_8, SDHCI_TIMING_MMC_HS400))
 	{
 		EPRINTF("Failed to init eMMC.");
 		goto out;
@@ -156,85 +142,61 @@ void print_mmc_info()
 		u32 speed = 0;
 
 		gfx_printf("%kCID:%k\n", 0xFF00DDFF, 0xFFCCCCCC);
-		switch (storage.csd.mmca_vsn)
+		switch (emmc_storage.csd.mmca_vsn)
 		{
-		case 0: /* MMC v1.0 - v1.2 */
-		case 1: /* MMC v1.4 */
-			gfx_printf(
-				" Vendor ID:  %03X\n"
-				" Model:      %c%c%c%c%c%c%c\n"
-				" HW rev:     %X\n"
-				" FW rev:     %X\n"
-				" S/N:        %03X\n"
-				" Month/Year: %02d/%04d\n\n",
-				storage.cid.manfid,
-				storage.cid.prod_name[0], storage.cid.prod_name[1],	storage.cid.prod_name[2],
-				storage.cid.prod_name[3], storage.cid.prod_name[4],	storage.cid.prod_name[5],
-				storage.cid.prod_name[6], storage.cid.hwrev, storage.cid.fwrev,
-				storage.cid.serial, storage.cid.month, storage.cid.year);
-			break;
 		case 2: /* MMC v2.0 - v2.2 */
 		case 3: /* MMC v3.1 - v3.3 */
 		case 4: /* MMC v4 */
 			gfx_printf(
 				" Vendor ID:  %X\n"
-				" Card/BGA:   %X\n"
 				" OEM ID:     %02X\n"
 				" Model:      %c%c%c%c%c%c\n"
 				" Prd Rev:    %X\n"
 				" S/N:        %04X\n"
 				" Month/Year: %02d/%04d\n\n",
-				storage.cid.manfid, storage.cid.card_bga, storage.cid.oemid,
-				storage.cid.prod_name[0], storage.cid.prod_name[1], storage.cid.prod_name[2],
-				storage.cid.prod_name[3], storage.cid.prod_name[4],	storage.cid.prod_name[5],
-				storage.cid.prv, storage.cid.serial, storage.cid.month, storage.cid.year);
+				emmc_storage.cid.manfid, emmc_storage.cid.oemid,
+				emmc_storage.cid.prod_name[0], emmc_storage.cid.prod_name[1], emmc_storage.cid.prod_name[2],
+				emmc_storage.cid.prod_name[3], emmc_storage.cid.prod_name[4],	emmc_storage.cid.prod_name[5],
+				emmc_storage.cid.prv, emmc_storage.cid.serial, emmc_storage.cid.month, emmc_storage.cid.year);
 			break;
 		default:
-			EPRINTFARGS("eMMC has unknown MMCA version %d", storage.csd.mmca_vsn);
 			break;
 		}
 
-		if (storage.csd.structure == 0)
+		if (emmc_storage.csd.structure == 0)
 			EPRINTF("Unknown CSD structure.");
 		else
 		{
 			gfx_printf("%kExtended CSD V1.%d:%k\n",
-				0xFF00DDFF, storage.ext_csd.ext_struct, 0xFFCCCCCC);
-			card_type = storage.ext_csd.card_type;
-			u8 card_type_support[96];
-			u8 pos_type = 0;
+				0xFF00DDFF, emmc_storage.ext_csd.ext_struct, 0xFFCCCCCC);
+			card_type = emmc_storage.ext_csd.card_type;
+			char card_type_support[96];
 			card_type_support[0] = 0;
 			if (card_type & EXT_CSD_CARD_TYPE_HS_26)
 			{
-				memcpy(card_type_support, "HS26", 4);
+				strcat(card_type_support, "HS26");
 				speed = (26 << 16) | 26;
-				pos_type += 4;
 			}
 			if (card_type & EXT_CSD_CARD_TYPE_HS_52)
 			{
-				memcpy(card_type_support + pos_type, ", HS52", 6);
+				strcat(card_type_support, ", HS52");
 				speed = (52 << 16) | 52;
-				pos_type += 6;
 			}
 			if (card_type & EXT_CSD_CARD_TYPE_DDR_1_8V)
 			{
-				memcpy(card_type_support + pos_type, ", DDR52_1.8V", 12);
+				strcat(card_type_support, ", DDR52_1.8V");
 				speed = (52 << 16) | 104;
-				pos_type += 12;
 			}
 			if (card_type & EXT_CSD_CARD_TYPE_HS200_1_8V)
 			{
-				memcpy(card_type_support + pos_type, ", HS200_1.8V", 12);
+				strcat(card_type_support, ", HS200_1.8V");
 				speed = (200 << 16) | 200;
-				pos_type += 12;
 			}
 			if (card_type & EXT_CSD_CARD_TYPE_HS400_1_8V)
 			{
-				memcpy(card_type_support + pos_type, ", HS400_1.8V", 12);
+				strcat(card_type_support, ", HS400_1.8V");
 				speed = (200 << 16) | 400;
-				pos_type += 12;
 			}
-			card_type_support[pos_type] = 0;
 
 			gfx_printf(
 				" Spec Version:  %02X\n"
@@ -245,16 +207,16 @@ void print_mmc_info()
 				" Max Rate:      %d MB/s (%d MHz)\n"
 				" Current Rate:  %d MB/s\n"
 				" Type Support:  ",
-				storage.csd.mmca_vsn, storage.ext_csd.rev, storage.ext_csd.dev_version, storage.csd.cmdclass,
-				storage.csd.capacity == (4096 * 512) ? "High" : "Low", speed & 0xFFFF, (speed >> 16) & 0xFFFF,
-				storage.csd.busspeed);
+				emmc_storage.csd.mmca_vsn, emmc_storage.ext_csd.rev, emmc_storage.ext_csd.dev_version, emmc_storage.csd.cmdclass,
+				emmc_storage.csd.capacity == (4096 * 512) ? "High" : "Low", speed & 0xFFFF, (speed >> 16) & 0xFFFF,
+				emmc_storage.csd.busspeed);
 			gfx_con.fntsz = 8;
 			gfx_printf("%s", card_type_support);
 			gfx_con.fntsz = 16;
 			gfx_printf("\n\n", card_type_support);
 
-			u32 boot_size = storage.ext_csd.boot_mult << 17;
-			u32 rpmb_size = storage.ext_csd.rpmb_mult << 17;
+			u32 boot_size = emmc_storage.ext_csd.boot_mult << 17;
+			u32 rpmb_size = emmc_storage.ext_csd.rpmb_mult << 17;
 			gfx_printf("%keMMC Partitions:%k\n", 0xFF00DDFF, 0xFFCCCCCC);
 			gfx_printf(" 1: %kBOOT0      %k\n    Size: %5d KiB (LBA Sectors: 0x%07X)\n", 0xFF96FF00, 0xFFCCCCCC,
 				boot_size / 1024, boot_size / 512);
@@ -266,13 +228,13 @@ void print_mmc_info()
 				rpmb_size / 1024, rpmb_size / 512);
 			gfx_put_small_sep();
 			gfx_printf(" 0: %kGPP (USER) %k\n    Size: %5d MiB (LBA Sectors: 0x%07X)\n\n", 0xFF96FF00, 0xFFCCCCCC,
-				storage.sec_cnt >> SECTORS_TO_MIB_COEFF, storage.sec_cnt);
+				emmc_storage.sec_cnt >> SECTORS_TO_MIB_COEFF, emmc_storage.sec_cnt);
 			gfx_put_small_sep();
 			gfx_printf("%kGPP (eMMC USER) partition table:%k\n", 0xFF00DDFF, 0xFFCCCCCC);
 
-			sdmmc_storage_set_mmc_partition(&storage, 0);
+			sdmmc_storage_set_mmc_partition(&emmc_storage, EMMC_GPP);
 			LIST_INIT(gpt);
-			nx_emmc_gpt_parse(&gpt, &storage);
+			nx_emmc_gpt_parse(&gpt, &emmc_storage);
 			int gpp_idx = 0;
 			LIST_FOREACH_ENTRY(emmc_part_t, part, &gpt, link)
 			{
@@ -286,7 +248,7 @@ void print_mmc_info()
 	}
 
 out:
-	sdmmc_storage_end(&storage);
+	sdmmc_storage_end(&emmc_storage);
 
 	btn_wait();
 }
@@ -298,10 +260,8 @@ void print_sdcard_info()
 	gfx_clear_partial_grey(0x1B, 0, 1256);
 	gfx_con_setpos(0, 0);
 
-	if (sd_mount())
+	if (sd_initialize(false))
 	{
-		u32 capacity;
-
 		gfx_printf("%kCard IDentification:%k\n", 0xFF00DDFF, 0xFFCCCCCC);
 		gfx_printf(
 			" Vendor ID:  %02x\n"
@@ -317,8 +277,8 @@ void print_sdcard_info()
 			sd_storage.cid.hwrev, sd_storage.cid.fwrev, sd_storage.cid.serial,
 			sd_storage.cid.month, sd_storage.cid.year);
 
+		u16 *sd_errors = sd_get_error_count();
 		gfx_printf("%kCard-Specific Data V%d.0:%k\n", 0xFF00DDFF, sd_storage.csd.structure + 1, 0xFFCCCCCC);
-		capacity = sd_storage.csd.capacity >> (20 - sd_storage.csd.read_blkbits);
 		gfx_printf(
 			" Cmd Classes:    %02X\n"
 			" Capacity:       %d MiB\n"
@@ -328,18 +288,39 @@ void print_sdcard_info()
 			" UHS Grade:      U%d\n"
 			" Video Class:    V%d\n"
 			" App perf class: A%d\n"
-			" Write Protect:  %d\n\n",
-			sd_storage.csd.cmdclass, capacity,
+			" Write Protect:  %d\n"
+			" SDMMC Errors:   %d %d %d\n\n",
+			sd_storage.csd.cmdclass, sd_storage.sec_cnt >> 11,
 			sd_storage.ssr.bus_width, sd_storage.csd.busspeed, sd_storage.csd.busspeed * 2,
 			sd_storage.ssr.speed_class, sd_storage.ssr.uhs_grade, sd_storage.ssr.video_class,
-			sd_storage.ssr.app_class, sd_storage.csd.write_protect);
+			sd_storage.ssr.app_class, sd_storage.csd.write_protect,
+			sd_errors[0], sd_errors[1], sd_errors[2]); // SD_ERROR_INIT_FAIL, SD_ERROR_RW_FAIL, SD_ERROR_RW_RETRY.
 
-		gfx_puts("Acquiring FAT volume info...\n\n");
-		f_getfree("", &sd_fs.free_clst, NULL);
-		gfx_printf("%kFound %s volume:%k\n Free:    %d MiB\n Cluster: %d KiB\n",
-				0xFF00DDFF, sd_fs.fs_type == FS_EXFAT ? "exFAT" : "FAT32", 0xFFCCCCCC,
-				sd_fs.free_clst * sd_fs.csize >> SECTORS_TO_MIB_COEFF, (sd_fs.csize > 1) ? (sd_fs.csize >> 1) : 512);
-		sd_unmount();
+		int res = f_mount(&sd_fs, "", 1);
+		if (!res)
+		{
+			gfx_puts("Acquiring FAT volume info...\n\n");
+			f_getfree("", &sd_fs.free_clst, NULL);
+			gfx_printf("%kFound %s volume:%k\n Free:    %d MiB\n Cluster: %d KiB\n",
+					0xFF00DDFF, sd_fs.fs_type == FS_EXFAT ? "exFAT" : "FAT32", 0xFFCCCCCC,
+					sd_fs.free_clst * sd_fs.csize >> SECTORS_TO_MIB_COEFF, (sd_fs.csize > 1) ? (sd_fs.csize >> 1) : 512);
+			f_mount(NULL, "", 1);
+		}
+		else
+		{
+			EPRINTFARGS("Failed to mount SD card (FatFS Error %d).\n"
+				"Make sure that a FAT partition exists..", res);
+		}
+
+		sdmmc_storage_end(&sd_storage);
+	}
+	else
+	{
+		EPRINTF("Failed to init SD card.");
+		if (!sdmmc_get_sd_inserted())
+			EPRINTF("Make sure that it is inserted.");
+		else
+			EPRINTF("SD Card Reader is not properly seated!");
 	}
 
 	btn_wait();
@@ -353,24 +334,22 @@ void print_tsec_key()
 	u32 retries = 0;
 
 	tsec_ctxt_t tsec_ctxt;
-	sdmmc_storage_t storage;
-	sdmmc_t sdmmc;
 
-	sdmmc_storage_init_mmc(&storage, &sdmmc, SDMMC_4, SDMMC_BUS_WIDTH_8, 4);
+	sdmmc_storage_init_mmc(&emmc_storage, &emmc_sdmmc, SDMMC_BUS_WIDTH_8, SDHCI_TIMING_MMC_HS400);
 
 	// Read package1.
 	u8 *pkg1 = (u8 *)malloc(0x40000);
-	sdmmc_storage_set_mmc_partition(&storage, 1);
-	sdmmc_storage_read(&storage, 0x100000 / NX_EMMC_BLOCKSIZE, 0x40000 / NX_EMMC_BLOCKSIZE, pkg1);
-	sdmmc_storage_end(&storage);
+	sdmmc_storage_set_mmc_partition(&emmc_storage, EMMC_BOOT0);
+	sdmmc_storage_read(&emmc_storage, 0x100000 / NX_EMMC_BLOCKSIZE, 0x40000 / NX_EMMC_BLOCKSIZE, pkg1);
+	sdmmc_storage_end(&emmc_storage);
 	const pkg1_id_t *pkg1_id = pkg1_identify(pkg1);
 	if (!pkg1_id)
 	{
-		EPRINTF("Unknown pkg1 version for reading\nTSEC firmware.");
+		EPRINTF("Unknown pkg1 version.");
 		goto out_wait;
 	}
 
-	u8 keys[0x10 * 2];
+	u8 keys[SE_KEY_128_SIZE * 2];
 	memset(keys, 0x00, 0x20);
 
 	tsec_ctxt.fw = (u8 *)pkg1 + pkg1_id->tsec_off;
@@ -417,15 +396,14 @@ void print_tsec_key()
 
 	if (res >= 0)
 	{
-		for (u32 j = 0; j < 0x10; j++)
+		for (u32 j = 0; j < SE_KEY_128_SIZE; j++)
 			gfx_printf("%02X", keys[j]);
-		
 
 		if (pkg1_id->kb == KB_FIRMWARE_VERSION_620)
 		{
 			gfx_printf("\n%kTSEC root: %k", 0xFF00DDFF, 0xFFCCCCCC);
-			for (u32 j = 0; j < 0x10; j++)
-				gfx_printf("%02X", keys[0x10 + j]);
+			for (u32 j = 0; j < SE_KEY_128_SIZE; j++)
+				gfx_printf("%02X", keys[SE_KEY_128_SIZE + j]);
 		}
 	}
 	else
@@ -440,9 +418,9 @@ void print_tsec_key()
 		{
 			char path[64];
 			emmcsn_path_impl(path, "/dumps", "tsec_keys.bin", NULL);
-			if (!sd_save_to_file(keys, 0x10 * 2, path))
+			if (!sd_save_to_file(keys, SE_KEY_128_SIZE * 2, path))
 				gfx_puts("\nDone!\n");
-			sd_unmount();
+			sd_end();
 		}
 	}
 	else
@@ -459,7 +437,7 @@ void print_fuel_gauge_info()
 {
 	int value = 0;
 
-	gfx_printf("%kFuel Gauge IC Info:\n%k", 0xFF00DDFF, 0xFFCCCCCC);
+	gfx_printf("%kFuel Gauge Info:\n%k", 0xFF00DDFF, 0xFFCCCCCC);
 
 	max17050_get_property(MAX17050_RepSOC, &value);
 	gfx_printf("Capacity now:           %3d%\n", value >> 8);
@@ -511,7 +489,7 @@ void print_battery_charger_info()
 {
 	int value = 0;
 
-	gfx_printf("%k\n\nBattery Charger IC Info:\n%k", 0xFF00DDFF, 0xFFCCCCCC);
+	gfx_printf("%k\n\nBattery Charger Info:\n%k", 0xFF00DDFF, 0xFFCCCCCC);
 
 	bq24193_get_property(BQ24193_InputVoltageLimit, &value);
 	gfx_printf("Input voltage limit:       %4d mV\n", value);
@@ -608,7 +586,7 @@ void print_battery_info()
 				EPRINTF("\nError creating fuel.bin file.");
 			else
 				gfx_puts("\nDone!\n");
-			sd_unmount();
+			sd_end();
 		}
 
 		btn_wait();
@@ -638,13 +616,13 @@ void bootrom_ipatches_info()
 	gfx_con_setpos(0, 0);
 
 	static const u32 BOOTROM_SIZE = 0x18000;
-	
+
 	u32 res = fuse_read_ipatch(_ipatch_process);
 	if (res != 0)
 		EPRINTFARGS("Failed to read ipatches. Error: %d", res);
 
 	gfx_puts("\nPress POWER to dump them to SD Card.\nPress VOL to go to the menu.\n");
-	
+
 	u32 btn = btn_wait();
 	if (btn & BTN_POWER)
 	{
@@ -662,22 +640,22 @@ void bootrom_ipatches_info()
 			}
 			else
 				EPRINTFARGS("Failed to read evp_thunks. Error: %d", res);
-			
+
 			emmcsn_path_impl(path, "/dumps", "bootrom_patched.bin", NULL);
 			if (!sd_save_to_file((u8 *)BOOTROM_BASE, BOOTROM_SIZE, path))
 				gfx_puts("\nbootrom_patched.bin saved!\n");
-			
+
 			u32 ipatch_backup[14];
 			memcpy(ipatch_backup, (void *)IPATCH_BASE, sizeof(ipatch_backup));
 			memset((void*)IPATCH_BASE, 0, sizeof(ipatch_backup));
-			
+
 			emmcsn_path_impl(path, "/dumps", "bootrom_unpatched.bin", NULL);
 			if (!sd_save_to_file((u8 *)BOOTROM_BASE, BOOTROM_SIZE, path))
 				gfx_puts("\nbootrom_unpatched.bin saved!\n");
-			
+
 			memcpy((void*)IPATCH_BASE, ipatch_backup, sizeof(ipatch_backup));
-			
-			sd_unmount();
+
+			sd_end();
 		}
 
 		btn_wait();

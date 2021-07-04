@@ -15,35 +15,28 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "di.h"
+#include <display/di.h>
 #include "tui.h"
-#include "../utils/btn.h"
-#include "../config/config.h"
-#include "../power/max17050.h"
-#include "../utils/util.h"
-
-#ifdef MENU_LOGO_ENABLE
-extern u8 *Kc_MENU_LOGO;
-#define X_MENU_LOGO       119
-#define Y_MENU_LOGO        57
-#define X_POS_MENU_LOGO   577
-#define Y_POS_MENU_LOGO  1179
-#endif //MENU_LOGO_ENABLE
+#include "../config.h"
+#include <power/max17050.h>
+#include <utils/btn.h>
+#include <utils/util.h>
 
 extern hekate_config h_cfg;
 
 void tui_sbar(bool force_update)
 {
 	u32 cx, cy;
+	static u32 sbar_time_keeping = 0;
 
-	u32 timePassed = get_tmr_s() - h_cfg.sbar_time_keeping;
+	u32 timePassed = get_tmr_s() - sbar_time_keeping;
 	if (!force_update)
 		if (timePassed < 5)
 			return;
 
 	u8 prevFontSize = gfx_con.fntsz;
 	gfx_con.fntsz = 16;
-	h_cfg.sbar_time_keeping = get_tmr_s();
+	sbar_time_keeping = get_tmr_s();
 
 	u32 battPercent = 0;
 	int battVoltCurr = 0;
@@ -83,8 +76,8 @@ void tui_pbar(int x, int y, u32 val, u32 fgcol, u32 bgcol)
 	gfx_printf("%k[%3d%%]%k", fgcol, val, 0xFFCCCCCC);
 
 	x += 7 * gfx_con.fntsz;
-	
-	for (int i = 0; i < (gfx_con.fntsz >> 3) * 6; i++)
+
+	for (u32 i = 0; i < (gfx_con.fntsz >> 3) * 6; i++)
 	{
 		gfx_line(x, y + i + 1, x + 3 * val, y + i + 1, fgcol);
 		gfx_line(x + 3 * val, y + i + 1, x + 3 * 100, y + i + 1, bgcol);
@@ -102,11 +95,6 @@ void *tui_do_menu(menu_t *menu)
 
 	gfx_clear_partial_grey(0x1B, 0, 1256);
 	tui_sbar(true);
-
-#ifdef MENU_LOGO_ENABLE
-	gfx_set_rect_rgb(Kc_MENU_LOGO,
-		X_MENU_LOGO, Y_MENU_LOGO, X_POS_MENU_LOGO, Y_POS_MENU_LOGO);
-#endif //MENU_LOGO_ENABLE
 
 	while (true)
 	{
@@ -157,14 +145,9 @@ void *tui_do_menu(menu_t *menu)
 		gfx_con_setcol(0xFFCCCCCC, 1, 0xFF1B1B1B);
 		gfx_putc('\n');
 
-		// Print help and battery status.
+		// Print errors, help and battery status.
 		gfx_con_setpos(0,  1127);
-		if (h_cfg.errors)
-		{
-			gfx_printf("%k Warning: %k", 0xFF800000, 0xFF555555);
-			if (h_cfg.errors & ERR_LIBSYS_LP0)
-				gfx_printf("Sleep mode library is missing!\n");
-		}
+		gfx_printf("%k Warning: %k Nyx is missing!", 0xFF800000, 0xFF555555);
 		gfx_con_setpos(0,  1191);
 		gfx_printf("%k VOL: Move up/down\n PWR: Select option%k", 0xFF555555, 0xFFCCCCCC);
 
@@ -214,10 +197,6 @@ void *tui_do_menu(menu_t *menu)
 			}
 			gfx_con.fntsz = 16;
 			gfx_clear_partial_grey(0x1B, 0, 1256);
-#ifdef MENU_LOGO_ENABLE
-			gfx_set_rect_rgb(Kc_MENU_LOGO,
-				X_MENU_LOGO, Y_MENU_LOGO, X_POS_MENU_LOGO, Y_POS_MENU_LOGO);
-#endif //MENU_LOGO_ENABLE
 		}
 		tui_sbar(false);
 	}

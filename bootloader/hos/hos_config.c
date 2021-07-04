@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (c) 2018-2019 CTCaer
+ * Copyright (c) 2018-2020 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -20,23 +20,22 @@
 #include "hos.h"
 #include "hos_config.h"
 #include "fss.h"
-#include "../libs/fatfs/ff.h"
-#include "../mem/heap.h"
-#include "../utils/dirlist.h"
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <storage/nx_sd.h>
+#include <utils/dirlist.h>
 
-#include "../gfx/gfx.h"
+#include <gfx_utils.h>
 
 //#define DPRINTF(...) gfx_printf(__VA_ARGS__)
 #define DPRINTF(...)
-
-extern void *sd_file_read(const char *path, u32 *fsize);
 
 static int _config_warmboot(launch_ctxt_t *ctxt, const char *value)
 {
 	ctxt->warmboot = sd_file_read(value, &ctxt->warmboot_size);
 	if (!ctxt->warmboot)
 		return 0;
-	
+
 	return 1;
 }
 
@@ -65,13 +64,13 @@ static int _config_kip1(launch_ctxt_t *ctxt, const char *value)
 	if (!memcmp(value + strlen(value) - 1, "*", 1))
 	{
 		char *dir = (char *)malloc(256);
-		memcpy(dir, value, strlen(value) + 1);
+		strcpy(dir, value);
 
 		u32 dirlen = 0;
 		dir[strlen(dir) - 2] = 0;
-		char *filelist = dirlist(dir, "*.kip*", false);
+		char *filelist = dirlist(dir, "*.kip*", false, false);
 
-		memcpy(dir + strlen(dir), "/", 2);
+		strcat(dir, "/");
 		dirlen = strlen(dir);
 
 		u32 i = 0;
@@ -82,7 +81,7 @@ static int _config_kip1(launch_ctxt_t *ctxt, const char *value)
 				if (!filelist[i * 256])
 					break;
 
-				memcpy(dir + dirlen, &filelist[i * 256], strlen(&filelist[i * 256]) + 1);
+				strcpy(dir + dirlen, &filelist[i * 256]);
 
 				merge_kip_t *mkip1 = (merge_kip_t *)malloc(sizeof(merge_kip_t));
 				mkip1->kip1 = sd_file_read(dir, &size);
@@ -181,6 +180,16 @@ static int _config_stock(launch_ctxt_t *ctxt, const char *value)
 	return 1;
 }
 
+static int _config_emummc_forced(launch_ctxt_t *ctxt, const char *value)
+{
+	if (*value == '1')
+	{
+		DPRINTF("Forced emuMMC\n");
+		ctxt->emummc_forced = true;
+	}
+	return 1;
+}
+
 static int _config_atmosphere(launch_ctxt_t *ctxt, const char *value)
 {
 	if (*value == '1')
@@ -191,9 +200,87 @@ static int _config_atmosphere(launch_ctxt_t *ctxt, const char *value)
 	return 1;
 }
 
+static int _config_dis_exo_user_exceptions(launch_ctxt_t *ctxt, const char *value)
+{
+	if (*value == '1')
+	{
+		DPRINTF("Disabled exosphere user exception handlers\n");
+		ctxt->exo_ctx.no_user_exceptions = true;
+	}
+	return 1;
+}
+
+static int _config_exo_user_pmu_access(launch_ctxt_t *ctxt, const char *value)
+{
+	if (*value == '1')
+	{
+		DPRINTF("Enabled user access to PMU\n");
+		ctxt->exo_ctx.user_pmu = true;
+	}
+	return 1;
+}
+
+static int _config_exo_usb3_force(launch_ctxt_t *ctxt, const char *value)
+{
+	// Override key found.
+	ctxt->exo_ctx.usb3_force = calloc(sizeof(bool), 1);
+
+	if (*value == '1')
+	{
+		DPRINTF("Enabled USB 3.0\n");
+		*ctxt->exo_ctx.usb3_force = true;
+	}
+	return 1;
+}
+
+static int _config_exo_cal0_blanking(launch_ctxt_t *ctxt, const char *value)
+{
+	// Override key found.
+	ctxt->exo_ctx.cal0_blank = calloc(sizeof(bool), 1);
+
+	if (*value == '1')
+	{
+		DPRINTF("Enabled prodinfo blanking\n");
+		*ctxt->exo_ctx.cal0_blank = true;
+	}
+	return 1;
+}
+
+static int _config_exo_cal0_writes_enable(launch_ctxt_t *ctxt, const char *value)
+{
+	// Override key found.
+	ctxt->exo_ctx.cal0_allow_writes_sys = calloc(sizeof(bool), 1);
+
+	if (*value == '1')
+	{
+		DPRINTF("Enabled prodinfo writes\n");
+		*ctxt->exo_ctx.cal0_allow_writes_sys = true;
+	}
+
+	return 1;
+}
+
 static int _config_fss(launch_ctxt_t *ctxt, const char *value)
 {
-	return parse_fss(ctxt, value);
+	LIST_FOREACH_ENTRY(ini_kv_t, kv, &ctxt->cfg->kvs, link)
+	{
+		if (!strcmp("fss0experimental", kv->key))
+		{
+			ctxt->fss0_experimental = *kv->val == '1';
+			break;
+		}
+	}
+
+	return parse_fss(ctxt, value, NULL);
+}
+
+static int _config_exo_fatal_payload(launch_ctxt_t *ctxt, const char *value)
+{
+	ctxt->exofatal = sd_file_read(value, &ctxt->exofatal_size);
+	if (!ctxt->exofatal)
+		return 0;
+
+	return 1;
 }
 
 typedef struct _cfg_handler_t
@@ -213,6 +300,13 @@ static const cfg_handler_t _config_handlers[] = {
 	{ "stock", _config_stock },
 	{ "atmosphere", _config_atmosphere },
 	{ "fss0", _config_fss },
+	{ "exofatal", _config_exo_fatal_payload},
+	{ "emummcforce", _config_emummc_forced },
+	{ "nouserexceptions", _config_dis_exo_user_exceptions },
+	{ "userpmu", _config_exo_user_pmu_access },
+	{ "usb3force", _config_exo_usb3_force },
+	{ "cal0blank", _config_exo_cal0_blanking },
+	{ "cal0writesys", _config_exo_cal0_writes_enable },
 	{ NULL, NULL },
 };
 
@@ -223,11 +317,15 @@ int parse_boot_config(launch_ctxt_t *ctxt)
 		for(u32 i = 0; _config_handlers[i].key; i++)
 		{
 			if (!strcmp(_config_handlers[i].key, kv->key))
+			{
 				if (!_config_handlers[i].handler(ctxt, kv->val))
 				{
+					gfx_con.mute = false;
 					EPRINTFARGS("Error while loading %s:\n%s", kv->key, kv->val);
+
 					return 0;
 				}
+			}
 		}
 	}
 

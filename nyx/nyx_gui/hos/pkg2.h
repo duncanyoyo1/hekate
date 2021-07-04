@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (C) 2018-2019 CTCaer
+ * Copyright (c) 2018-2020 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,8 +18,8 @@
 #ifndef _PKG2_H_
 #define _PKG2_H_
 
-#include "../utils/types.h"
-#include "../utils/list.h"
+#include <utils/types.h>
+#include <utils/list.h>
 
 #define PKG2_MAGIC 0x31324B50
 #define PKG2_SEC_BASE 0x80000000
@@ -27,9 +27,12 @@
 #define PKG2_SEC_INI1 1
 
 #define INI1_MAGIC 0x31494E49
-#define PKG2_NEWKERN_INI1_START 0x168
-#define PKG2_NEWKERN_INI1_END   0x170
-#define PKG2_NEWKERN_START      0x800
+#define PKG2_NEWKERN_GET_INI1_HEURISTIC 0xD2800015 // Offset of OP + 12 is the INI1 offset.
+#define PKG2_NEWKERN_START 0x800
+
+extern u32 pkg2_newkern_ini1_val;
+extern u32 pkg2_newkern_ini1_start;
+extern u32 pkg2_newkern_ini1_end;
 
 typedef struct _pkg2_hdr_t
 {
@@ -38,7 +41,8 @@ typedef struct _pkg2_hdr_t
 	u32 magic;
 	u32 base;
 	u32 pad0;
-	u16 version;
+	u8  pkg2_ver;
+	u8  bl_ver;
 	u16 pad1;
 	u32 sec_size[4];
 	u32 sec_off[4];
@@ -86,9 +90,10 @@ typedef struct _pkg2_kip1_info_t
 	link_t link;
 } pkg2_kip1_info_t;
 
+void pkg2_get_newkern_info(u8 *kern_data);
 u32 pkg2_calc_kip1_size(pkg2_kip1_t *kip1);
-void pkg2_parse_kips(link_t *info, pkg2_hdr_t *pkg2, bool *new_pkg2);
+bool pkg2_parse_kips(link_t *info, pkg2_hdr_t *pkg2, bool *new_pkg2);
 
-pkg2_hdr_t *pkg2_decrypt(void *data);
+pkg2_hdr_t *pkg2_decrypt(void *data, u8 kb);
 
 #endif

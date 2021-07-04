@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 CTCaer
+ * Copyright (c) 2018-2020 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,30 +18,28 @@
 
 #include "gui.h"
 #include "gui_emmc_tools.h"
+#include "gui_tools.h"
 #include "fe_emmc_tools.h"
-#include "../config/config.h"
+#include "../config.h"
 #include "../hos/pkg1.h"
 #include "../hos/pkg2.h"
 #include "../hos/hos.h"
 #include "../hos/sept.h"
-#include "../libs/fatfs/ff.h"
-#include "../mem/heap.h"
-#include "../sec/se.h"
-#include "../soc/fuse.h"
-#include "../storage/nx_emmc.h"
-#include "../storage/sdmmc.h"
-#include "../utils/sprintf.h"
-#include "../utils/util.h"
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <sec/se.h>
+#include <soc/fuse.h>
+#include <storage/nx_sd.h>
+#include <storage/sdmmc.h>
+#include <utils/sprintf.h>
+#include <utils/util.h>
 
 extern boot_cfg_t b_cfg;
 extern hekate_config h_cfg;
 
-extern bool sd_mount();
-extern int  sd_save_to_file(void *buf, u32 size, const char *filename);
-extern void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
+extern char *emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
 
-#pragma GCC push_options
-#pragma GCC target ("thumb")
+lv_obj_t *ums_mbox;
 
 typedef struct _emmc_backup_buttons_t
 {
@@ -112,20 +110,25 @@ static void _create_window_backup_restore(emmcPartType_t type, const char* win_l
 	lv_obj_align(label_info, label_sep, LV_ALIGN_OUT_BOTTOM_LEFT, LV_DPI / 4, LV_DPI / 10);
 	emmc_tool_gui_ctxt.label_info = label_info;
 
-	static lv_style_t bar_teal_bg, bar_white_ind;
+	static lv_style_t bar_teal_bg, bar_teal_ind, bar_white_ind;
 
 	lv_style_copy(&bar_teal_bg, lv_theme_get_current()->bar.bg);
 	bar_teal_bg.body.main_color = LV_COLOR_HEX(0x005a47);
 	bar_teal_bg.body.grad_color = bar_teal_bg.body.main_color;
+
+	lv_style_copy(&bar_teal_ind, lv_theme_get_current()->bar.indic);
+	bar_teal_ind.body.main_color = LV_COLOR_HEX(0x00FFC9);
+	bar_teal_ind.body.grad_color = bar_teal_ind.body.main_color;
 
 	lv_style_copy(&bar_white_ind, lv_theme_get_current()->bar.indic);
 	bar_white_ind.body.main_color = LV_COLOR_HEX(0xF0F0F0);
 	bar_white_ind.body.grad_color = bar_white_ind.body.main_color;
 
 	emmc_tool_gui_ctxt.bar_teal_bg = &bar_teal_bg;
+	emmc_tool_gui_ctxt.bar_teal_ind = &bar_teal_ind;
 	emmc_tool_gui_ctxt.bar_white_ind = &bar_white_ind;
 
-	lv_obj_t * bar = lv_bar_create(h1, NULL);
+	lv_obj_t *bar = lv_bar_create(h1, NULL);
 	lv_obj_set_size(bar, LV_DPI * 38 / 10, LV_DPI / 5);
 	lv_bar_set_range(bar, 0, 100);
 	lv_bar_set_value(bar, 0);
@@ -156,10 +159,29 @@ static void _create_window_backup_restore(emmcPartType_t type, const char* win_l
 		restore_emmc_selected(type, &emmc_tool_gui_ctxt);
 
 	nyx_window_toggle_buttons(win, false);
+
+	// Refresh AutoRCM button.
+	if (emmc_btn_ctxt.restore && (type == PART_BOOT) && !emmc_btn_ctxt.raw_emummc)
+	{
+		if (get_autorcm_status(false))
+			lv_btn_set_state(autorcm_btn, LV_BTN_STATE_TGL_REL);
+		else
+			lv_btn_set_state(autorcm_btn, LV_BTN_STATE_REL);
+		nyx_generic_onoff_toggle(autorcm_btn);
+
+		if (h_cfg.rcm_patched)
+		{
+			lv_obj_set_click(autorcm_btn, false);
+			lv_btn_set_state(autorcm_btn, LV_BTN_STATE_INA);
+		}
+	}
 }
 
 static lv_res_t _emmc_backup_buttons_decider(lv_obj_t *btn)
 {
+	if (!nyx_emmc_check_battery_enough())
+		return LV_RES_OK;
+
 	char *win_label = lv_label_get_text(lv_obj_get_child(btn, NULL));
 
 	if (emmc_btn_ctxt.emmc_boot == btn)
@@ -201,7 +223,7 @@ static lv_res_t _emmc_backup_buttons_raw_toggle(lv_obj_t *btn)
 		lv_obj_realign(emmc_btn_ctxt.emmc_boot);
 
 		if (!emmc_btn_ctxt.restore)
-			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_DOWNLOAD"  eMMC RAW GPP");
+			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_UPLOAD"  eMMC RAW GPP");
 		else
 			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_DOWNLOAD"  eMMC RAW GPP");
 		lv_obj_realign(emmc_btn_ctxt.emmc_raw_gpp);
@@ -226,21 +248,13 @@ static lv_res_t _emmc_backup_buttons_raw_toggle(lv_obj_t *btn)
 	else // Backup/Restore from and to emuMMC.
 	{
 		if (!emmc_btn_ctxt.restore)
-		{
 			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_boot, NULL), SYMBOL_UPLOAD"  SD emuMMC BOOT0 & BOOT1");
-			lv_obj_set_click(emmc_btn_ctxt.emmc_boot, false);
-			lv_btn_set_state(emmc_btn_ctxt.emmc_boot, LV_BTN_STATE_INA);
-		}
 		else
 			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_boot, NULL), SYMBOL_DOWNLOAD"  SD emuMMC BOOT0 & BOOT1");
 		lv_obj_realign(emmc_btn_ctxt.emmc_boot);
 
 		if (!emmc_btn_ctxt.restore)
-		{
-			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_DOWNLOAD"  SD emuMMC RAW GPP");
-			lv_obj_set_click(emmc_btn_ctxt.emmc_raw_gpp, false);
-			lv_btn_set_state(emmc_btn_ctxt.emmc_raw_gpp, LV_BTN_STATE_INA);
-		}
+			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_UPLOAD"  SD emuMMC RAW GPP");
 		else
 			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_DOWNLOAD"  SD emuMMC RAW GPP");
 		lv_obj_realign(emmc_btn_ctxt.emmc_raw_gpp);
@@ -309,7 +323,7 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 		lv_label_set_static_text(label_btn, SYMBOL_UPLOAD"  eMMC BOOT0 & BOOT1");
 	else
 		lv_label_set_static_text(label_btn, SYMBOL_DOWNLOAD"  eMMC BOOT0 & BOOT1");
-	
+
 	lv_obj_align(btn1, line_sep, LV_ALIGN_OUT_BOTTOM_LEFT, LV_DPI / 4, LV_DPI / 4);
 	lv_btn_set_action(btn1, LV_BTN_ACTION_CLICK, _emmc_backup_buttons_decider);
 	emmc_btn_ctxt.emmc_boot = btn1;
@@ -319,15 +333,15 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 	if (!emmc_btn_ctxt.restore)
 	{
 		lv_label_set_static_text(label_txt2,
-			"Allows you to backup your BOOT physical partitions.\n"
-			"They contain your BCT, keys and various package1.\n"
+			"Allows you to backup the BOOT physical partitions.\n"
+			"They contain the BCT, keys and various package1.\n"
 			"#FF8000 These are paired with the RAW GPP backup.#");
 	}
 	else
 	{
 		lv_label_set_static_text(label_txt2,
-			"Allows you to restore your BOOT physical partitions.\n"
-			"They contain your BCT, keys and various package1.\n"
+			"Allows you to restore the BOOT physical partitions.\n"
+			"They contain the BCT, keys and various package1.\n"
 			"#FF8000 These are paired with the RAW GPP restore.#");
 	}
 	lv_obj_set_style(label_txt2, &hint_small_style);
@@ -349,14 +363,14 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 	if (!emmc_btn_ctxt.restore)
 	{
 		lv_label_set_static_text(label_txt2,
-			"Allows you to backup your GPP physical partition.\n"
+			"Allows you to backup the GPP physical partition.\n"
 			"It contains, CAL0, various package2, SYSTEM, USER, etc.\n"
 			"#FF8000 This is paired with the BOOT0/1 backups.#");
 	}
 	else
 	{
 		lv_label_set_static_text(label_txt2,
-			"Allows you to restore your GPP physical partition.\n"
+			"Allows you to restore the GPP physical partition.\n"
 			"It contains, CAL0, various package2, SYSTEM, USER, etc.\n"
 			"#FF8000 This is paired with the BOOT0/1 restore.#");
 	}
@@ -410,7 +424,7 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 			"Allows you to restore ALL partitions from RAW GPP\n"
 			"It contains, CAL0, various package2, SYSTEM, USER, etc.\n");
 	}
-	
+
 	lv_obj_set_style(label_txt4, &hint_small_style);
 	lv_obj_align(label_txt4, btn3, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
 
@@ -453,5 +467,3 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 
 	return LV_RES_OK;
 }
-
-#pragma GCC pop_options

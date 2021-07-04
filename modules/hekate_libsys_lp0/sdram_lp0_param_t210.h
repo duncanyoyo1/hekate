@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013-2015, NVIDIA CORPORATION.  All rights reserved.
  * Copyright 2014 Google Inc.
- * Copyright (C) 2018 CTCaer
+ * Copyright (c) 2018 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -20,8 +20,8 @@
  * directly converting BCT config files (*.cfg) into C structure.
  */
 
-#ifndef __SOC_NVIDIA_TEGRA210_SDRAM_PARAM_H__
-#define __SOC_NVIDIA_TEGRA210_SDRAM_PARAM_H__
+#ifndef __TEGRA210_SDRAM_PARAM_H__
+#define __TEGRA210_SDRAM_PARAM_H__
 
 #include "types.h"
 
@@ -57,7 +57,7 @@ enum
 /**
  * Defines the SDRAM parameter structure
  */
-struct sdram_params
+struct sdram_params_t210
 {
 
 	/* Specifies the type of memory device */

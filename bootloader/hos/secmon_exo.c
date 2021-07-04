@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 CTCaer
+ * Copyright (c) 2018-2020 CTCaer
  * Copyright (c) 2019 Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -19,22 +19,21 @@
 #include <stdlib.h>
 
 #include "hos.h"
-#include "../config/config.h"
-#include "../gfx/di.h"
-#include "../gfx/gfx.h"
-#include "../libs/fatfs/ff.h"
-#include "../mem/heap.h"
-#include "../soc/fuse.h"
+#include "../config.h"
+#include <display/di.h>
+#include <gfx_utils.h>
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <soc/fuse.h>
 #include "../storage/emummc.h"
-#include "../storage/sdmmc.h"
-#include "../utils/btn.h"
-#include "../utils/util.h"
-#include "../utils/types.h"
+#include "../storage/nx_emmc.h"
+#include <storage/nx_sd.h>
+#include <storage/sdmmc.h>
+#include <utils/btn.h>
+#include <utils/util.h>
+#include <utils/types.h>
 
 extern hekate_config h_cfg;
-
-extern bool sd_mount();
-extern int sd_save_to_file(void *buf, u32 size, const char *filename);
 
 enum emuMMC_Type
 {
@@ -81,8 +80,12 @@ typedef struct _exo_cfg_t
 {
 	u32 magic;
 	u32 fwno;
-	u32 flags;
-	u32 reserved[5];
+	u32 flags[2];
+	u16 display_id;
+	u8  uart_port;
+	u8  uart_invert;
+	u32 uart_baudrate;
+	u32 rsvd1[2];
 	exo_emummc_config_t emummc_cfg;
 } exo_cfg_t;
 
@@ -121,83 +124,231 @@ typedef struct _atm_fatal_error_ctx
 	u64 stack_dump_size;
 	u64 stack_trace[0x20];
 	u8  stack_dump[0x100];
+	u8  tls[0x100];
 } atm_fatal_error_ctx;
 
 #define ATM_FATAL_ERR_CTX_ADDR 0x4003E000
-#define  ATM_FATAL_MAGIC 0x31454641 // AFE1
+#define  ATM_FATAL_MAGIC       0x30454641 // AFE0
 
-#define ATM_WB_HEADER_OFF 0x244
-#define  ATM_WB_MAGIC 0x30544257
+#define ATM_EXO_FATAL_ADDR     0x80020000
+#define  ATM_EXO_FATAL_SIZE    0x20000
+
+#define ATM_WB_HEADER_OFF      0x244
+#define  ATM_WB_MAGIC          0x30544257 // WBT0
 
 // Exosphère mailbox defines.
-#define EXO_CFG_ADDR      0x8000F000
-#define  EXO_MAGIC_VAL      0x304F5845
-#define  EXO_FLAG_DBG_PRIV  (1 << 1)
-#define  EXO_FLAG_DBG_USER  (1 << 2)
+#define EXO_CFG_ADDR             0x8000F000
+#define  EXO_MAGIC_VAL           0x304F5845
+#define  EXO_FLAG_DBG_PRIV        BIT(1)
+#define  EXO_FLAG_DBG_USER        BIT(2)
+#define  EXO_FLAG_NO_USER_EXC     BIT(3)
+#define  EXO_FLAG_USER_PMU        BIT(4)
+#define  EXO_FLAG_CAL0_BLANKING   BIT(5)
+#define  EXO_FLAG_CAL0_WRITES_SYS BIT(6)
+#define  EXO_FLAG_ENABLE_USB3     BIT(7)
 
-void config_exosphere(const char *id, u32 kb, void *warmboot, bool stock)
+#define EXO_FW_VER(mj, mn, rv) (((mj) << 24) | ((mn) << 16) | ((rv) << 8))
+
+void config_exosphere(launch_ctxt_t *ctxt, u32 warmboot_base, bool exo_new)
 {
-	u32 exoFwNo = 0;
-	u32 exoFlags = 0;
+	u32 exo_fw_no = 0;
+	u32 exo_flags = 0;
+	bool usb3_force = false;
+	bool user_debug = false;
+	bool cal0_blanking = false;
+	bool cal0_allow_writes_sys = false;
 
 	memset((exo_cfg_t *)EXO_CFG_ADDR, 0, sizeof(exo_cfg_t));
 
 	volatile exo_cfg_t *exo_cfg = (exo_cfg_t *)EXO_CFG_ADDR;
 
-	switch (kb)
+	// Old exosphere target versioning. Use fuses for a simpler encoding.
+	if (ctxt->pkg1_id->fuses <= 3 || ctxt->pkg1_id->fuses >= 10) // 1.0.0 - 3.0.0, 8.1.0+.
+		exo_fw_no = ctxt->pkg1_id->fuses;
+	else
+		exo_fw_no = ctxt->pkg1_id->fuses - 1;                    // 3.0.1 - 7.0.1, 8.0.0 - 8.0.1.
+
+	if (!memcmp(ctxt->pkg1_id->id, "20190314172056", 8))         // 8.0.0 - 8.0.1.
+		exo_fw_no++;
+
+	if (!memcmp(ctxt->pkg1_id->id, "20210129111626", 8))         // 12.0.0.
+		exo_fw_no++;
+
+	// Feed old exosphere target versioning to new.
+	if (exo_new)
 	{
-	case KB_FIRMWARE_VERSION_100_200:
-		if (!strcmp(id, "20161121183008"))
-			exoFwNo = 1;
-		else
-			exoFwNo = 2;
-		break;
-	case KB_FIRMWARE_VERSION_300:
-		exoFwNo = 3;
-		break;
-	default:
-		exoFwNo = kb + 1;
-		if (!strcmp(id, "20190314172056") || !strcmp(id, "20190531152432"))
-			exoFwNo++; // ATM_TARGET_FW_800/810.
-		break;
+		switch (exo_fw_no)
+		{
+		case 1 ... 4:
+		case 6:
+			exo_fw_no = EXO_FW_VER(exo_fw_no, 0, 0);
+			break;
+		case 5:
+			if (!ctxt->exo_ctx.fs_is_510)
+				exo_fw_no = EXO_FW_VER(5, 0, 0);
+			else
+				exo_fw_no = EXO_FW_VER(5, 1, 0);
+			break;
+		case 7:
+			exo_fw_no = EXO_FW_VER(6, 2, 0);
+			break;
+		case 8 ... 9:
+			exo_fw_no = EXO_FW_VER(exo_fw_no - 1, 0, 0);
+			break;
+		case 10:
+			exo_fw_no = EXO_FW_VER(8, 1, 0);
+			break;
+		case 11:
+			exo_fw_no = EXO_FW_VER(9, 0, 0);
+			break;
+		case 12:
+			exo_fw_no = EXO_FW_VER(9, 1, 0);
+			break;
+		case 13 ... 15:
+			exo_fw_no = EXO_FW_VER(exo_fw_no - 3, 0, 0);
+			break;
+		}
+	}
+
+	// Parse exosphere.ini.
+	if (!ctxt->stock)
+	{
+		LIST_INIT(ini_sections);
+		if (ini_parse(&ini_sections, "exosphere.ini", false))
+		{
+			LIST_FOREACH_ENTRY(ini_sec_t, ini_sec, &ini_sections, link)
+			{
+				// Only parse exosphere section.
+				if (!(ini_sec->type == INI_CHOICE) || strcmp(ini_sec->name, "exosphere"))
+					continue;
+
+				LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
+				{
+					if (!strcmp("debugmode_user", kv->key))
+						user_debug = atoi(kv->val);
+					else if (!strcmp("log_port", kv->key))
+						exo_cfg->uart_port = atoi(kv->val);
+					else if (!strcmp("log_inverted", kv->key))
+						exo_cfg->uart_invert = atoi(kv->val);
+					else if (!strcmp("log_baud_rate", kv->key))
+						exo_cfg->uart_baudrate = atoi(kv->val);
+					else if (emu_cfg.enabled && !h_cfg.emummc_force_disable)
+					{
+						if (!strcmp("blank_prodinfo_emummc", kv->key))
+							cal0_blanking = atoi(kv->val);
+					}
+					else
+					{
+						if (!strcmp("blank_prodinfo_sysmmc", kv->key))
+							cal0_blanking = atoi(kv->val);
+						else if (!strcmp("allow_writing_to_cal_sysmmc", kv->key))
+							cal0_allow_writes_sys = atoi(kv->val);
+					}
+				}
+				break;
+			}
+		}
+
+		// Parse usb mtim settings. Avoid parsing if it's overridden.
+		if (ctxt->fss0_main_path && !ctxt->exo_ctx.usb3_force)
+		{
+			char set_path[256];
+			strcpy(set_path, ctxt->fss0_main_path);
+			strcat(set_path, "config/system_settings.ini");
+			LIST_INIT(sys_settings);
+			if (ini_parse(&ini_sections, set_path, false))
+			{
+				LIST_FOREACH_ENTRY(ini_sec_t, ini_sec, &ini_sections, link)
+				{
+					// Only parse usb section.
+					if (!(ini_sec->type == INI_CHOICE) || strcmp(ini_sec->name, "usb"))
+						continue;
+
+					LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
+					{
+						if (!strcmp("usb30_force_enabled", kv->key))
+						{
+							usb3_force = !strcmp("u8!0x1", kv->val);
+							break; // Only parse usb30_force_enabled key.
+						}
+					}
+					break;
+				}
+			}
+		}
 	}
 
 	// To avoid problems, make private debug mode always on if not semi-stock.
-	if (!stock || (emu_cfg.enabled && !h_cfg.emummc_force_disable))
-		exoFlags |= EXO_FLAG_DBG_PRIV;
+	if (!ctxt->stock || (emu_cfg.enabled && !h_cfg.emummc_force_disable))
+		exo_flags |= EXO_FLAG_DBG_PRIV;
+
+	// Enable user debug.
+	if (user_debug)
+		exo_flags |= EXO_FLAG_DBG_USER;
+
+	// Disable proper failure handling.
+	if (ctxt->exo_ctx.no_user_exceptions)
+		exo_flags |= EXO_FLAG_NO_USER_EXC;
+
+	// Enable user access to PMU.
+	if (ctxt->exo_ctx.user_pmu)
+		exo_flags |= EXO_FLAG_USER_PMU;
+
+	// Enable USB 3.0. Check if system_settings ini value is overridden. If not, check if enabled in ini.
+	if ((ctxt->exo_ctx.usb3_force && *ctxt->exo_ctx.usb3_force)
+			|| (!ctxt->exo_ctx.usb3_force && usb3_force))
+		exo_flags |= EXO_FLAG_ENABLE_USB3;
+
+	// Enable prodinfo blanking. Check if exo ini value is overridden. If not, check if enabled in exo ini.
+	if ((ctxt->exo_ctx.cal0_blank && *ctxt->exo_ctx.cal0_blank)
+			|| (!ctxt->exo_ctx.cal0_blank && cal0_blanking))
+		exo_flags |= EXO_FLAG_CAL0_BLANKING;
+
+	// Allow prodinfo writes. Check if exo ini value is overridden. If not, check if enabled in exo ini.
+	if ((ctxt->exo_ctx.cal0_allow_writes_sys && *ctxt->exo_ctx.cal0_allow_writes_sys)
+			|| (!ctxt->exo_ctx.cal0_allow_writes_sys && cal0_allow_writes_sys))
+		exo_flags |= EXO_FLAG_CAL0_WRITES_SYS;
 
 	// Set mailbox values.
 	exo_cfg->magic = EXO_MAGIC_VAL;
-
-	exo_cfg->fwno = exoFwNo;
-
-	exo_cfg->flags = exoFlags;
+	exo_cfg->fwno = exo_fw_no;
+	exo_cfg->flags[0] = exo_flags;
 
 	// If warmboot is lp0fw, add in RSA modulus.
-	volatile wb_cfg_t *wb_cfg = (wb_cfg_t *)(warmboot + ATM_WB_HEADER_OFF);
+	volatile wb_cfg_t *wb_cfg = (wb_cfg_t *)(warmboot_base + ATM_WB_HEADER_OFF);
 
 	if (wb_cfg->magic == ATM_WB_MAGIC)
 	{
-		wb_cfg->fwno = exoFwNo;
-
-		sdmmc_storage_t storage;
-		sdmmc_t sdmmc;
+		wb_cfg->fwno = exo_fw_no;
 
 		// Set warmboot binary rsa modulus.
 		u8 *rsa_mod = (u8 *)malloc(512);
 
-		sdmmc_storage_init_mmc(&storage, &sdmmc, SDMMC_4, SDMMC_BUS_WIDTH_8, 4);
-		sdmmc_storage_set_mmc_partition(&storage, 1);
-		sdmmc_storage_read(&storage, 1, 1, rsa_mod);
-		sdmmc_storage_end(&storage);
+		sdmmc_storage_set_mmc_partition(&emmc_storage, EMMC_BOOT0);
 
-		// Patch AutoRCM out.
-		if ((fuse_read_odm(4) & 3) != 3)
-			rsa_mod[0x10] = 0xF7;
-		else
-			rsa_mod[0x10] = 0x37;
+		u32 sector;
+		u8  mod0, mod1;
 
-		memcpy(warmboot + 0x10, rsa_mod + 0x10, 0x100);
+		// Get the correct RSA modulus byte masks.
+		nx_emmc_get_autorcm_masks(&mod0, &mod1);
+
+		// Iterate BCTs.
+		for (u32 i = 0; i < 4; i++)
+		{
+			sector = 1 + (32 * i); // 0x4000 bct + 0x200 offset.
+			sdmmc_storage_read(&emmc_storage, sector, 1, rsa_mod);
+
+			// Check if 2nd byte of modulus is correct.
+			if (rsa_mod[0x11] != mod1)
+				continue;
+
+			// Patch AutoRCM out.
+			rsa_mod[0x10] = mod0;
+
+			break;
+		}
+
+		memcpy((void *)(warmboot_base + 0x10), rsa_mod + 0x10, 0x100);
 	}
 
 	if (emu_cfg.enabled && !h_cfg.emummc_force_disable)
@@ -212,13 +363,34 @@ void config_exosphere(const char *id, u32 kb, void *warmboot, bool stock)
 		else
 			strcpy((char *)exo_cfg->emummc_cfg.file_cfg.path, emu_cfg.path);
 
-		if (emu_cfg.nintendo_path && !stock)
+		if (emu_cfg.nintendo_path && !ctxt->stock)
 			strcpy((char *)exo_cfg->emummc_cfg.nintendo_path, emu_cfg.nintendo_path);
-		else if (stock)
+		else if (ctxt->stock)
 			strcpy((char *)exo_cfg->emummc_cfg.nintendo_path, "Nintendo");
 		else
 			exo_cfg->emummc_cfg.nintendo_path[0] = 0;
 	}
+
+	// Copy over exosphere fatal for Mariko.
+	if (h_cfg.t210b01)
+	{
+		memset((void *)ATM_EXO_FATAL_ADDR, 0, ATM_EXO_FATAL_SIZE);
+		if (ctxt->exofatal)
+			memcpy((void *)ATM_EXO_FATAL_ADDR, ctxt->exofatal, ctxt->exofatal_size);
+
+		// Set display id.
+		exo_cfg->display_id = display_get_decoded_panel_id();
+	}
+
+#ifdef DEBUG_UART_PORT
+	// Ovverride logging parameters if set in compile time.
+	if (!ctxt->stock)
+	{
+		exo_cfg->uart_port = DEBUG_UART_PORT;
+		exo_cfg->uart_invert = DEBUG_UART_INVERT;
+		exo_cfg->uart_baudrate = DEBUG_UART_BAUDRATE;
+	}
+#endif
 }
 
 static const char *get_error_desc(u32 error_desc)
@@ -226,23 +398,27 @@ static const char *get_error_desc(u32 error_desc)
 	switch (error_desc)
 	{
 	case 0x100:
-		return "Instruction Abort";
+		return "IABRT"; // Instruction Abort.
 	case 0x101:
-		return "Data Abort";
+		return "DABRT"; // Data Abort.
 	case 0x102:
-		return "PC Misalignment";
+		return "IUA";   // Instruction Unaligned Access.
 	case 0x103:
-		return "SP Misalignment";
+		return "DUA";   // Data Unaligned Access.
 	case 0x104:
-		return "Trap";
+		return "UDF";   // Undefined Instruction.
 	case 0x106:
-		return "SError";
+		return "SYS";   // System Error.
 	case 0x301:
-		return "Bad SVC";
+		return "SVC";   // Bad arguments or unimplemented SVC.
+	case 0xF00:
+		return "KRNL";  // Kernel panic.
+	case 0xFFD:
+		return "SO";    // Stack Overflow.
 	case 0xFFE:
-		return "std::abort()";
+		return "std::abort";
 	default:
-		return "Unknown";
+		return "UNK";
 	}
 }
 
@@ -250,44 +426,42 @@ void secmon_exo_check_panic()
 {
 	volatile atm_fatal_error_ctx *rpt = (atm_fatal_error_ctx *)ATM_FATAL_ERR_CTX_ADDR;
 
-	if (rpt->magic != ATM_FATAL_MAGIC)
+	// Mask magic to maintain compatibility with any AFE version, thanks to additive struct members.
+	if ((rpt->magic & 0xF0FFFFFF) != ATM_FATAL_MAGIC)
 		return;
 
 	gfx_clear_grey(0x1B);
 	gfx_con_setpos(0, 0);
 
 	WPRINTF("Panic occurred while running Atmosphere.\n\n");
-	WPRINTFARGS("Title ID:   %08X%08X", (u32)((u64)rpt->title_id >> 32), (u32)rpt->title_id);
-	WPRINTFARGS("Error Desc: %s (0x%x)\n", get_error_desc(rpt->error_desc), rpt->error_desc);
+	WPRINTFARGS("Title ID: %08X%08X", (u32)((u64)rpt->title_id >> 32), (u32)rpt->title_id);
+	WPRINTFARGS("Error:    %s (0x%x)\n", get_error_desc(rpt->error_desc), rpt->error_desc);
 
-	if (sd_mount())
+	// Save context to the SD card.
+	char filepath[0x40];
+	f_mkdir("atmosphere/fatal_errors");
+	strcpy(filepath, "/atmosphere/fatal_errors/report_");
+	itoa((u32)((u64)rpt->report_identifier >> 32), filepath + strlen(filepath), 16);
+	itoa((u32)(rpt->report_identifier), filepath + strlen(filepath), 16);
+	strcat(filepath, ".bin");
+
+	if (!sd_save_to_file((void *)rpt, sizeof(atm_fatal_error_ctx), filepath))
 	{
-		// Save context to the SD card.
-		char filepath[0x40];
-		f_mkdir("atmosphere/fatal_errors");
-		memcpy(filepath, "/atmosphere/fatal_errors/report_", 33);
-		itoa((u32)((u64)rpt->report_identifier >> 32), filepath + strlen(filepath), 16);
-		itoa((u32)(rpt->report_identifier), filepath + strlen(filepath), 16);
-		memcpy(filepath + strlen(filepath), ".bin", 5);
-
-		sd_save_to_file((void *)rpt, sizeof(atm_fatal_error_ctx), filepath);
-
 		gfx_con.fntsz = 8;
 		WPRINTFARGS("Report saved to %s\n", filepath);
+		gfx_con.fntsz = 16;
 	}
 
 	// Change magic to invalid, to prevent double-display of error/bootlooping.
-	rpt->magic = 0x0;
+	rpt->magic = 0;
 
-	gfx_con.fntsz = 16;
 	gfx_printf("\n\nPress POWER to continue.\n");
 
 	display_backlight_brightness(100, 1000);
 	msleep(1000);
 
-	u32 btn = btn_wait();
-	while (!(btn & BTN_POWER))
-		btn = btn_wait();
+	while (!(btn_wait() & BTN_POWER))
+		;
 
 	display_backlight_brightness(0, 1000);
 	gfx_con_setpos(0, 0);

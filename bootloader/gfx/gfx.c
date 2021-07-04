@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (C) 2018-2019 CTCaer
+ * Copyright (c) 2018-2021 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,6 +18,12 @@
 #include <stdarg.h>
 #include <string.h>
 #include "gfx.h"
+
+// Global gfx console and context.
+gfx_ctxt_t gfx_ctxt;
+gfx_con_t gfx_con;
+
+static bool gfx_con_init_done = false;
 
 static const u8 _gfx_font[] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Char 032 ( )
@@ -117,28 +123,28 @@ static const u8 _gfx_font[] = {
 	0x00, 0x00, 0x00, 0x4C, 0x32, 0x00, 0x00, 0x00  // Char 126 (~)
 };
 
+void gfx_clear_grey(u8 color)
+{
+	memset(gfx_ctxt.fb, color, gfx_ctxt.width * gfx_ctxt.height * 4);
+}
+
+void gfx_clear_partial_grey(u8 color, u32 pos_x, u32 height)
+{
+	memset(gfx_ctxt.fb + pos_x * gfx_ctxt.stride, color, height * 4 * gfx_ctxt.stride);
+}
+
+void gfx_clear_color(u32 color)
+{
+	for (u32 i = 0; i < gfx_ctxt.width * gfx_ctxt.height; i++)
+		gfx_ctxt.fb[i] = color;
+}
+
 void gfx_init_ctxt(u32 *fb, u32 width, u32 height, u32 stride)
 {
 	gfx_ctxt.fb = fb;
 	gfx_ctxt.width = width;
 	gfx_ctxt.height = height;
 	gfx_ctxt.stride = stride;
-}
-
-void gfx_clear_grey(u8 color)
-{
-	memset(gfx_ctxt.fb, color, 0x3C0000);
-}
-
-void gfx_clear_color(u32 color)
-{
-	for (u32 i = 0; i < gfx_ctxt.height * gfx_ctxt.stride; i++)
-		gfx_ctxt.fb[i] = color;
-}
-
-void gfx_clear_partial_grey(u8 color, u32 pos_x, u32 height)
-{
-	memset(gfx_ctxt.fb + pos_x * gfx_ctxt.stride, color, height * 4 * gfx_ctxt.stride);
 }
 
 void gfx_con_init()
@@ -153,6 +159,8 @@ void gfx_con_init()
 	gfx_con.fillbg = 1;
 	gfx_con.bgcol = 0xFF1B1B1B;
 	gfx_con.mute = 0;
+
+	gfx_con_init_done = true;
 }
 
 void gfx_con_setcol(u32 fgcol, int fillbg, u32 bgcol)
@@ -185,9 +193,9 @@ void gfx_putc(char c)
 			u8 *cbuf = (u8 *)&_gfx_font[8 * (c - 32)];
 			u32 *fb = gfx_ctxt.fb + gfx_con.x + gfx_con.y * gfx_ctxt.stride;
 
-			for (u32 i = 0; i < 16; i+=2)
+			for (u32 i = 0; i < 16; i += 2)
 			{
-				u8 v = *cbuf++;
+				u8 v = *cbuf;
 				for (u32 k = 0; k < 2; k++)
 				{
 					for (u32 j = 0; j < 8; j++)
@@ -212,13 +220,14 @@ void gfx_putc(char c)
 					fb += gfx_ctxt.stride - 16;
 					v = *cbuf;
 				}
+				cbuf++;
 			}
 			gfx_con.x += 16;
 		}
 		else if (c == '\n')
 		{
 			gfx_con.x = 0;
-			gfx_con.y +=16;
+			gfx_con.y += 16;
 			if (gfx_con.y > gfx_ctxt.height - 16)
 				gfx_con.y = 0;
 		}
@@ -254,12 +263,11 @@ void gfx_putc(char c)
 		}
 		break;
 	}
-	
 }
 
-void gfx_puts(const char *s)
+void gfx_puts(char *s)
 {
-	if (!s || gfx_con.mute)
+	if (!s || !gfx_con_init_done || gfx_con.mute)
 		return;
 
 	for (; *s; s++)
@@ -315,7 +323,7 @@ void gfx_put_big_sep()
 
 void gfx_printf(const char *fmt, ...)
 {
-	if (gfx_con.mute)
+	if (!gfx_con_init_done || gfx_con.mute)
 		return;
 
 	va_list ap;
@@ -389,10 +397,12 @@ void gfx_printf(const char *fmt, ...)
 	va_end(ap);
 }
 
-void gfx_hexdump(u32 base, const u8 *buf, u32 len)
+void gfx_hexdump(u32 base, const void *buf, u32 len)
 {
-	if (gfx_con.mute)
+	if (!gfx_con_init_done || gfx_con.mute)
 		return;
+
+	u8 *buff = (u8 *)buf;
 
 	u8 prevFontSize = gfx_con.fntsz;
 	gfx_con.fntsz = 8;
@@ -405,7 +415,7 @@ void gfx_hexdump(u32 base, const u8 *buf, u32 len)
 				gfx_puts("| ");
 				for(u32 j = 0; j < 0x10; j++)
 				{
-					u8 c = buf[i - 0x10 + j];
+					u8 c = buff[i - 0x10 + j];
 					if(c >= 32 && c <= 126)
 						gfx_putc(c);
 					else
@@ -415,7 +425,7 @@ void gfx_hexdump(u32 base, const u8 *buf, u32 len)
 			}
 			gfx_printf("%08x: ", base + i);
 		}
-		gfx_printf("%02x ", buf[i]);
+		gfx_printf("%02x ", buff[i]);
 		if (i == len - 1)
 		{
 			int ln = len % 0x10 != 0;
@@ -429,7 +439,7 @@ void gfx_hexdump(u32 base, const u8 *buf, u32 len)
 			gfx_puts("| ");
 			for(u32 j = 0; j < (ln ? k : k + 1); j++)
 			{
-				u8 c = buf[i - k + j];
+				u8 c = buff[i - k + j];
 				if(c >= 32 && c <= 126)
 					gfx_putc(c);
 				else

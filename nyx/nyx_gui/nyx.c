@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018 naehrwert
  *
- * Copyright (c) 2018-2019 CTCaer
+ * Copyright (c) 2018-2021 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -19,49 +19,50 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "config/config.h"
-#include "gfx/di.h"
-#include "gfx/gfx.h"
+#include <memory_map.h>
+
+#include "config.h"
+#include <display/di.h>
+#include <gfx_utils.h>
 #include "hos/hos.h"
-#include "ianos/ianos.h"
-#include "libs/compr/blz.h"
-#include "libs/fatfs/ff.h"
-#include "mem/heap.h"
-#include "mem/minerva.h"
-#include "mem/sdram.h"
-#include "power/max77620.h"
-#include "soc/bpmp.h"
-#include "soc/fuse.h"
-#include "soc/gpio.h"
-#include "soc/hw_init.h"
-#include "soc/i2c.h"
-#include "soc/pmc.h"
-#include "soc/t210.h"
-#include "soc/uart.h"
-#include "storage/sdmmc.h"
-#include "utils/btn.h"
-#include "utils/dirlist.h"
-#include "utils/list.h"
-#include "utils/util.h"
+#include <ianos/ianos.h>
+#include <libs/compr/blz.h>
+#include <libs/fatfs/ff.h>
+#include <mem/heap.h>
+#include <mem/minerva.h>
+#include <mem/sdram.h>
+#include <power/max77620.h>
+#include <soc/clock.h>
+#include <soc/bpmp.h>
+#include <soc/fuse.h>
+#include <soc/gpio.h>
+#include <soc/hw_init.h>
+#include <soc/i2c.h>
+#include <soc/pinmux.h>
+#include <soc/pmc.h>
+#include <soc/t210.h>
+#include <soc/uart.h>
+#include "storage/nx_emmc.h"
+#include <storage/nx_sd.h>
+#include <storage/sdmmc.h>
+#include <utils/btn.h>
+#include <utils/dirlist.h>
+#include <utils/list.h>
+#include <utils/util.h>
 
 #include "frontend/fe_emmc_tools.h"
 #include "frontend/gui.h"
-
-//TODO: ugly.
-sdmmc_t sd_sdmmc;
-sdmmc_storage_t sd_storage;
-FATFS sd_fs;
-static bool sd_mounted = false;
-static bool sd_init_done = false;
 
 #ifdef MENU_LOGO_ENABLE
 u8 *Kc_MENU_LOGO;
 #endif //MENU_LOGO_ENABLE
 
+nyx_config n_cfg;
 hekate_config h_cfg;
+
 const volatile ipl_ver_meta_t __attribute__((section ("._ipl_version"))) ipl_ver = {
-	.magic = BL_MAGIC,
-	.version = (BL_VER_MJ + '0') | ((BL_VER_MN + '0') << 8) | ((BL_VER_HF + '0') << 16),
+	.magic = NYX_MAGIC,
+	.version = (NYX_VER_MJ + '0') | ((NYX_VER_MN + '0') << 8) | ((NYX_VER_HF + '0') << 16),
 	.rsvd0 = 0,
 	.rsvd1 = 0
 };
@@ -69,142 +70,52 @@ const volatile ipl_ver_meta_t __attribute__((section ("._ipl_version"))) ipl_ver
 volatile nyx_storage_t *nyx_str = (nyx_storage_t *)NYX_STORAGE_ADDR;
 volatile boot_cfg_t *b_cfg;
 
-bool get_sd_card_removed()
+char *emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage)
 {
-	if (sd_init_done && !!gpio_read(GPIO_PORT_Z, GPIO_PIN_1))
-		return true;
-	
-	return false;
-}
+	static char emmc_sn[9] = {0};
 
-bool sd_mount()
-{
-	if (sd_mounted)
-		return true;
+	// Check if eMMC S/N storage has valid data and skip parsing in that case.
+	if (emmc_sn[0] && strcmp(emmc_sn, "00000000"))
+		goto create_dir;
 
-	int res = 0;
-
-	if (!sd_init_done)
-	{
-		res = !sdmmc_storage_init_sd(&sd_storage, &sd_sdmmc, SDMMC_1, SDMMC_BUS_WIDTH_4, 11);
-		if (!res)
-			sd_init_done = true;
-	}
-
-	if (res)
-	{
-		EPRINTF("Failed to init SD card.\nMake sure that it is inserted.\nOr that SD reader is properly seated!");
-	}
-	else
-	{
-		int res = f_mount(&sd_fs, "", 1);
-		if (res == FR_OK)
-		{
-			sd_mounted = true;
-			return true;
-		}
-		else
-		{
-			EPRINTFARGS("Failed to mount SD card (FatFS Error %d).\nMake sure that a FAT partition exists..", res);
-		}
-	}
-
-	return false;
-}
-
-void sd_unmount(bool deinit)
-{
-	if (sd_init_done && sd_mounted)
-	{
-		f_mount(NULL, "", 1);
-		sd_mounted = false;
-	}
-	if (sd_init_done && deinit)
-	{
-		sdmmc_storage_end(&sd_storage);
-		sd_init_done = false;
-	}
-}
-
-void *sd_file_read(const char *path, u32 *fsize)
-{
-	FIL fp;
-	if (f_open(&fp, path, FA_READ) != FR_OK)
-		return NULL;
-
-	u32 size = f_size(&fp);
-	if (fsize)
-		*fsize = size;
-
-	void *buf = malloc(size);
-
-	if (f_read(&fp, buf, size, NULL) != FR_OK)
-	{
-		free(buf);
-		f_close(&fp);
-
-		return NULL;
-	}
-
-	f_close(&fp);
-
-	return buf;
-}
-
-int sd_save_to_file(void *buf, u32 size, const char *filename)
-{
-	FIL fp;
-	u32 res = 0;
-	res = f_open(&fp, filename, FA_CREATE_ALWAYS | FA_WRITE);
-	if (res)
-	{
-		EPRINTFARGS("Error (%d) creating file\n%s.\n", res, filename);
-		return res;
-	}
-
-	f_write(&fp, buf, size, NULL);
-	f_close(&fp);
-
-	return 0;
-}
-
-void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage)
-{
-	sdmmc_storage_t storage2;
-	sdmmc_t sdmmc;
-	char emmcSN[9];
-	bool init_done = false;
-
-	memcpy(path, "backup", 7);
-	f_mkdir(path);
-
+	// Get actual eMMC S/N.
 	if (!storage)
 	{
-		if (!sdmmc_storage_init_mmc(&storage2, &sdmmc, SDMMC_4, SDMMC_BUS_WIDTH_8, 4))
-			memcpy(emmcSN, "00000000", 9);
+		if (!sdmmc_storage_init_mmc(&emmc_storage, &emmc_sdmmc, SDMMC_BUS_WIDTH_8, SDHCI_TIMING_MMC_HS400))
+			strcpy(emmc_sn, "00000000");
 		else
 		{
-			init_done = true;
-			itoa(storage2.cid.serial, emmcSN, 16);
+			itoa(emmc_storage.cid.serial, emmc_sn, 16);
+			sdmmc_storage_end(&emmc_storage);
 		}
 	}
 	else
-		itoa(storage->cid.serial, emmcSN, 16);
+		itoa(storage->cid.serial, emmc_sn, 16);
 
-	u32 sub_dir_len = strlen(sub_dir);   // Can be a null-terminator.
-	u32 filename_len = strlen(filename); // Can be a null-terminator.
+create_dir:
+	// Check if only eMMC S/N was requested.
+	if (!path)
+		return emmc_sn;
 
-	memcpy(path + strlen(path), "/", 2);
-	memcpy(path + strlen(path), emmcSN, 9);
+	// Create main folder.
+	strcpy(path, "backup");
 	f_mkdir(path);
-	memcpy(path + strlen(path), sub_dir, sub_dir_len + 1);
-	if (sub_dir_len)
-		f_mkdir(path);
-	memcpy(path + strlen(path), "/", 2);
-	memcpy(path + strlen(path), filename, filename_len + 1);
 
-	if (init_done)
-		sdmmc_storage_end(&storage2);
+	// Create eMMC S/N folder.
+	strcat(path, "/");
+	strcat(path, emmc_sn);
+	f_mkdir(path);
+
+	// Create sub folder if defined. Dir slash must be included.
+	strcat(path, sub_dir);  // Can be a null-terminator.
+	if (strlen(sub_dir))
+		f_mkdir(path);
+
+	// Add filename.
+	strcat(path, "/");
+	strcat(path, filename); // Can be a null-terminator.
+
+	return emmc_sn;
 }
 
 // This is a safe and unused DRAM region for our payloads.
@@ -214,13 +125,15 @@ void emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t
 #define PATCHED_RELOC_ENTRY 0x40010000
 #define EXT_PAYLOAD_ADDR    0xC0000000
 #define RCM_PAYLOAD_ADDR    (EXT_PAYLOAD_ADDR + ALIGN(PATCHED_RELOC_SZ, 0x10))
-#define COREBOOT_ADDR       (0xD0000000 - 0x100000)
+#define COREBOOT_END_ADDR   0xD0000000
 #define CBFS_DRAM_EN_ADDR   0x4003e000
 #define  CBFS_DRAM_MAGIC    0x4452414D // "DRAM"
 
+static void *coreboot_addr;
+
 void reloc_patcher(u32 payload_dst, u32 payload_src, u32 payload_size)
 {
-	memcpy((u8 *)payload_src, (u8 *)NYX_LOAD_ADDR, PATCHED_RELOC_SZ);
+	memcpy((u8 *)payload_src, (u8 *)nyx_str->hekate, PATCHED_RELOC_SZ);
 
 	volatile reloc_meta_t *relocator = (reloc_meta_t *)(payload_src + RELOC_META_OFF);
 
@@ -231,7 +144,7 @@ void reloc_patcher(u32 payload_dst, u32 payload_src, u32 payload_size)
 
 	if (payload_size == 0x7000)
 	{
-		memcpy((u8 *)(payload_src + ALIGN(PATCHED_RELOC_SZ, 0x10)), (u8 *)COREBOOT_ADDR, 0x7000); //Bootblock
+		memcpy((u8 *)(payload_src + ALIGN(PATCHED_RELOC_SZ, 0x10)), coreboot_addr, 0x7000); //Bootblock
 		*(vu32 *)CBFS_DRAM_EN_ADDR = CBFS_DRAM_MAGIC;
 	}
 }
@@ -244,7 +157,7 @@ lv_res_t launch_payload(lv_obj_t *list)
 		goto out;
 
 	char path[128];
-	
+
 	strcpy(path,"bootloader/payloads/");
 	strcat(path, filename);
 
@@ -254,7 +167,6 @@ lv_res_t launch_payload(lv_obj_t *list)
 		if (f_open(&fp, path, FA_READ))
 		{
 			EPRINTFARGS("Payload file is missing!\n(%s)", path);
-			sd_unmount(false);
 
 			goto out;
 		}
@@ -266,139 +178,267 @@ lv_res_t launch_payload(lv_obj_t *list)
 		if (size < 0x30000)
 			buf = (void *)RCM_PAYLOAD_ADDR;
 		else
-			buf = (void *)COREBOOT_ADDR;
+		{
+			coreboot_addr = (void *)(COREBOOT_END_ADDR - size);
+			buf = coreboot_addr;
+			if (h_cfg.t210b01)
+			{
+				f_close(&fp);
+
+				EPRINTF("Coreboot not allowed on Mariko!");
+
+				goto out;
+			}
+		}
 
 		if (f_read(&fp, buf, size, NULL))
 		{
 			f_close(&fp);
-			sd_unmount(false);
 
 			goto out;
 		}
 
 		f_close(&fp);
 
-		sd_unmount(true);
+		sd_end();
 
 		if (size < 0x30000)
 		{
 			reloc_patcher(PATCHED_RELOC_ENTRY, EXT_PAYLOAD_ADDR, ALIGN(size, 0x10));
-			reconfig_hw_workaround(false, byte_swap_32(*(u32 *)(buf + size - sizeof(u32))));
+			hw_reinit_workaround(false, byte_swap_32(*(u32 *)(buf + size - sizeof(u32))));
 		}
 		else
 		{
 			reloc_patcher(PATCHED_RELOC_ENTRY, EXT_PAYLOAD_ADDR, 0x7000);
-			reconfig_hw_workaround(true, 0);
+			hw_reinit_workaround(true, 0);
 		}
 
 		void (*ext_payload_ptr)() = (void *)EXT_PAYLOAD_ADDR;
+
+		// Some cards (Sandisk U1), do not like a fast power cycle. Wait min 100ms.
+		sdmmc_storage_init_wait_sd();
 
 		// Launch our payload.
 		(*ext_payload_ptr)();
 	}
 
 out:
+	sd_unmount();
+
 	return LV_RES_OK;
 }
 
 void load_saved_configuration()
 {
 	LIST_INIT(ini_sections);
-	LIST_INIT(ini_list_sections);
+	LIST_INIT(ini_nyx_sections);
 
+	// Load hekate configuration.
 	if (ini_parse(&ini_sections, "bootloader/hekate_ipl.ini", false))
 	{
-		// Load configuration.
 		LIST_FOREACH_ENTRY(ini_sec_t, ini_sec, &ini_sections, link)
 		{
-			// Skip other ini entries for autoboot.
-			if (ini_sec->type == INI_CHOICE)
+			// Only parse config section.
+			if (ini_sec->type == INI_CHOICE && !strcmp(ini_sec->name, "config"))
 			{
-				if (!strcmp(ini_sec->name, "config"))
+				LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
 				{
-					LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
+					if (!strcmp("autoboot", kv->key))
+						h_cfg.autoboot = atoi(kv->val);
+					else if (!strcmp("autoboot_list", kv->key))
+						h_cfg.autoboot_list = atoi(kv->val);
+					else if (!strcmp("bootwait", kv->key))
+						h_cfg.bootwait = atoi(kv->val);
+					else if (!strcmp("backlight", kv->key))
 					{
-						if (!strcmp("autoboot", kv->key))
-							h_cfg.autoboot = atoi(kv->val);
-						else if (!strcmp("autoboot_list", kv->key))
-							h_cfg.autoboot_list = atoi(kv->val);
-						else if (!strcmp("bootwait", kv->key))
-							h_cfg.bootwait = atoi(kv->val);
-						else if (!strcmp("verification", kv->key))
-							h_cfg.verification = atoi(kv->val);
-						else if (!strcmp("backlight", kv->key))
-						{
-							h_cfg.backlight = atoi(kv->val);
-							if (h_cfg.backlight <= 20)
-								h_cfg.backlight = 30;
-						}
-						else if (!strcmp("autohosoff", kv->key))
-							h_cfg.autohosoff = atoi(kv->val);
-						else if (!strcmp("autonogc", kv->key))
-							h_cfg.autonogc = atoi(kv->val);
-						else if (!strcmp("brand", kv->key))
-						{
-							h_cfg.brand = malloc(strlen(kv->val) + 1);
-							strcpy(h_cfg.brand, kv->val);
-						}
-						else if (!strcmp("tagline", kv->key))
-						{
-							h_cfg.tagline = malloc(strlen(kv->val) + 1);
-							strcpy(h_cfg.tagline, kv->val);
-						}
+						h_cfg.backlight = atoi(kv->val);
+						if (h_cfg.backlight <= 20)
+							h_cfg.backlight = 30;
 					}
-
-					continue;
+					else if (!strcmp("autohosoff", kv->key))
+						h_cfg.autohosoff = atoi(kv->val);
+					else if (!strcmp("autonogc", kv->key))
+						h_cfg.autonogc = atoi(kv->val);
+					else if (!strcmp("updater2p", kv->key))
+						h_cfg.updater2p = atoi(kv->val);
+					else if (!strcmp("bootprotect", kv->key))
+						h_cfg.bootprotect = atoi(kv->val);
 				}
+
+				break;
 			}
 		}
+	}
+
+	// Load Nyx configuration.
+	if (ini_parse(&ini_nyx_sections, "bootloader/nyx.ini", false))
+	{
+		LIST_FOREACH_ENTRY(ini_sec_t, ini_sec, &ini_nyx_sections, link)
+		{
+			// Only parse config section.
+			if (ini_sec->type == INI_CHOICE && !strcmp(ini_sec->name, "config"))
+			{
+				LIST_FOREACH_ENTRY(ini_kv_t, kv, &ini_sec->kvs, link)
+				{
+					if (!strcmp("themecolor", kv->key))
+						n_cfg.themecolor = atoi(kv->val);
+					else if (!strcmp("timeoff", kv->key))
+						n_cfg.timeoff = strtol(kv->val, NULL, 16);
+					else if (!strcmp("homescreen", kv->key))
+						n_cfg.home_screen = atoi(kv->val);
+					else if (!strcmp("verification", kv->key))
+						n_cfg.verification = atoi(kv->val);
+					else if (!strcmp("umsemmcrw", kv->key))
+						n_cfg.ums_emmc_rw = atoi(kv->val) == 1;
+					else if (!strcmp("jcdisable", kv->key))
+						n_cfg.jc_disable = atoi(kv->val) == 1;
+					else if (!strcmp("bpmpclock", kv->key))
+						n_cfg.bpmp_clock = strtol(kv->val, NULL, 10);
+				}
+
+				break;
+			}
+		}
+	}
+}
+
+#define EXCP_EN_ADDR   0x4003FFFC
+#define  EXCP_MAGIC 0x30505645      // EVP0
+#define EXCP_TYPE_ADDR 0x4003FFF8
+#define  EXCP_TYPE_RESET 0x545352   // RST
+#define  EXCP_TYPE_UNDEF 0x464455   // UDF
+#define  EXCP_TYPE_PABRT 0x54424150 // PABT
+#define  EXCP_TYPE_DABRT 0x54424144 // DABT
+#define EXCP_LR_ADDR   0x4003FFF4
+
+static void _show_errors()
+{
+	u32 *excp_enabled = (u32 *)EXCP_EN_ADDR;
+	u32 *excp_type = (u32 *)EXCP_TYPE_ADDR;
+	u32 *excp_lr = (u32 *)EXCP_LR_ADDR;
+
+	if (*excp_enabled == EXCP_MAGIC)
+	{
+		gfx_clear_grey(0);
+		gfx_con_setpos(0, 0);
+		display_backlight_brightness(100, 1000);
+
+		display_activate_console();
+
+		WPRINTFARGS("An exception occurred (LR %08X):\n", *excp_lr);
+		switch (*excp_type)
+		{
+		case EXCP_TYPE_RESET:
+			WPRINTF("RESET");
+			break;
+		case EXCP_TYPE_UNDEF:
+			WPRINTF("UNDEF");
+			break;
+		case EXCP_TYPE_PABRT:
+			WPRINTF("PABRT");
+			break;
+		case EXCP_TYPE_DABRT:
+			WPRINTF("DABRT");
+			break;
+		}
+		WPRINTF("\n");
+
+		// Clear the exception.
+		*excp_lr = 0;
+		*excp_type = 0;
+		*excp_enabled = 0;
+
+		WPRINTF("Press any key...");
+
+		msleep(2000);
+		btn_wait();
+
+		reload_nyx();
 	}
 }
 
 void nyx_init_load_res()
 {
 	bpmp_mmu_enable();
+	bpmp_clk_rate_get();
+
+	// Set a modest clock for init. It will be restored later if possible.
+	bpmp_clk_rate_set(BPMP_CLK_LOWER_BOOST);
 
 	// Set bootloader's default configuration.
 	set_default_configuration();
+	set_nyx_default_configuration();
 
-	gfx_init_ctxt((u32 *)FB_ADDRESS, 720, 1280, 720);
+	// Reset new info if magic not correct.
+	if (nyx_str->info.magic != NYX_NEW_INFO)
+	{
+		nyx_str->info.sd_init = 0;
+		for (u32 i = 0; i < 3; i++)
+			nyx_str->info.sd_errors[i] = 0;
+	}
+
+	// Clear info magic.
+	nyx_str->info.magic = 0;
+
+	// Set display id from previous initialization.
+	display_set_decoded_panel_id(nyx_str->info.disp_id);
+
+	// Initialize gfx console.
+	gfx_init_ctxt((u32 *)LOG_FB_ADDRESS, 1280, 656, 656);
 	gfx_con_init();
+
+	// Show exception errors if any.
+	_show_errors();
 
 	sd_mount();
 
+	// Train DRAM and switch to max frequency.
 	minerva_init();
-	minerva_change_freq(FREQ_1600);
 
 	load_saved_configuration();
-	
-	FIL fp;
-	f_open(&fp, "bootloader/sys/res.pak", FA_READ);
-	f_read(&fp, (void *)NYX_RES_ADDR, f_size(&fp), NULL);
-	f_close(&fp);
 
-	icon_switch = bmp_to_lvimg_obj("bootloader/res/icon_switch.bmp");
-	icon_payload = bmp_to_lvimg_obj("bootloader/res/icon_payload.bmp");
-	icon_lakka = bmp_to_lvimg_obj("bootloader/res/icon_lakka.bmp");
+	// Initialize nyx cfg to lower clock for T210.
+	// In case of lower binned SoC, this can help with hangs.
+	if (!n_cfg.bpmp_clock)
+	{
+		n_cfg.bpmp_clock = h_cfg.t210b01 ? 1 : 2; // Set lower clock for T210.
+		create_nyx_config_entry(false);
+		n_cfg.bpmp_clock = h_cfg.t210b01 ? 1 : 0; // Restore for T210 and keep for T210B01.
+	}
+
+	// Restore clock to max.
+	if (n_cfg.bpmp_clock < 2)
+		bpmp_clk_rate_set(BPMP_CLK_DEFAULT_BOOST);
+
+	FIL fp;
+	if (!f_open(&fp, "bootloader/sys/res.pak", FA_READ))
+	{
+		f_read(&fp, (void *)NYX_RES_ADDR, f_size(&fp), NULL);
+		f_close(&fp);
+	}
+
+	// If no custom switch icon exists, load normal.
+	if (f_stat("bootloader/res/icon_switch_custom.bmp", NULL))
+		icon_switch = bmp_to_lvimg_obj("bootloader/res/icon_switch.bmp");
+	else
+		icon_switch = bmp_to_lvimg_obj("bootloader/res/icon_switch_custom.bmp");
+
+	// If no custom payload icon exists, load normal.
+	if (f_stat("bootloader/res/icon_payload_custom.bmp", NULL))
+		icon_payload = bmp_to_lvimg_obj("bootloader/res/icon_payload.bmp");
+	else
+		icon_payload = bmp_to_lvimg_obj("bootloader/res/icon_payload_custom.bmp");
+
+	// Load background resource if any.
 	hekate_bg = bmp_to_lvimg_obj("bootloader/res/background.bmp");
 
-	sd_unmount(false);
-
-	h_cfg.rcm_patched = fuse_check_patched_rcm();
-
-	bpmp_clk_rate_set(BPMP_CLK_SUPER_BOOST);
+	sd_unmount();
 }
 
-#define IPL_STACK_TOP  0x90010000
-#define IPL_HEAP_START 0x90020000
-#define IPL_HEAP_END   0xB5000000
-
-extern void pivot_stack(u32 stack_top);
-
 #if (LV_LOG_PRINTF == 1)
-	#include "soc/clock.h"
-	#include "soc/gpio.h"
-	#include "soc/pinmux.h"
+	#include <soc/clock.h>
+	#include <soc/gpio.h>
+	#include <soc/pinmux.h>
 #endif
 
 void ipl_main()
@@ -406,17 +446,28 @@ void ipl_main()
 	//Tegra/Horizon configuration goes to 0x80000000+, package2 goes to 0xA9800000, we place our heap in between.
 	heap_init(IPL_HEAP_START);
 
+
 	b_cfg = (boot_cfg_t *)(nyx_str->hekate + 0x94);
 
-#if (LV_LOG_PRINTF == 1)
-	gpio_config(GPIO_PORT_G, GPIO_PIN_0, GPIO_MODE_SPIO);
-	gpio_config(GPIO_PORT_D, GPIO_PIN_1, GPIO_MODE_GPIO);
-	pinmux_config_uart(UART_B);
-	clock_enable_uart(UART_B);
-	uart_init(UART_B, 115200);
+	// Important: Preserve version header!
+	__asm__ ("" : : "" (ipl_ver));
 
-	uart_send(UART_B, (u8 *)"Hekate-NYX: Hello!\r\n", 20);
-	uart_wait_idle(UART_B, UART_TX_IDLE);
+#ifdef DEBUG_UART_PORT
+	#if DEBUG_UART_PORT == UART_B
+		gpio_config(GPIO_PORT_G, GPIO_PIN_0, GPIO_MODE_SPIO);
+		gpio_config(GPIO_PORT_D, GPIO_PIN_1, GPIO_MODE_GPIO);
+	#endif
+	#if DEBUG_UART_PORT == UART_C
+		gpio_config(GPIO_PORT_G, GPIO_PIN_0, GPIO_MODE_GPIO);
+		gpio_config(GPIO_PORT_D, GPIO_PIN_1, GPIO_MODE_SPIO);
+	#endif
+	pinmux_config_uart(DEBUG_UART_PORT);
+	clock_enable_uart(DEBUG_UART_PORT);
+	uart_init(DEBUG_UART_PORT, DEBUG_UART_BAUDRATE);
+	uart_invert(DEBUG_UART_PORT, DEBUG_UART_INVERT, UART_INVERT_TXD);
+
+	uart_send(DEBUG_UART_PORT, (u8 *)"hekate-NYX: Hello!\r\n", 20);
+	uart_wait_idle(DEBUG_UART_PORT, UART_TX_IDLE);
 #endif
 
 	// Initialize the rest of hw and load nyx's resources.
@@ -424,6 +475,7 @@ void ipl_main()
 
 	nyx_load_and_run();
 
+	// Halt BPMP if we managed to get out of execution.
 	while (true)
-		;
+		bpmp_halt();
 }

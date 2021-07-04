@@ -17,9 +17,14 @@
 #ifndef _GUI_TOOLS_H_
 #define _GUI_TOOLS_H_
 
-#include "../libs/lvgl/lvgl.h"
+#include <libs/lvgl/lvgl.h>
+
+extern lv_obj_t *ums_mbox;
 
 void create_tab_tools(lv_theme_t *th, lv_obj_t *parent);
-void sept_run_dump();
+void nyx_run_ums(void *param);
+void sept_run_dump(void *param);
+bool get_autorcm_status(bool change);
+lv_res_t action_ums_sd(lv_obj_t *btn);
 
 #endif

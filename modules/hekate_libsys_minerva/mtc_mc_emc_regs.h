@@ -23,8 +23,9 @@
 /* Clock controller registers */
 #define CLK_RST_CONTROLLER_PLLM_BASE           0x90
 #define CLK_RST_CONTROLLER_PLLM_MISC2          0x9C
-#define  PLLM_ENABLE (1 << 30)
-#define  PLLM_LOCK   (1 << 27)
+#define  PLLM_ENABLE    (1 << 30)
+#define  PLLM_LOCK      (1 << 27)
+#define  PLLM_EN_LCKDET (1 << 4)
 
 #define CLK_RST_CONTROLLER_CLK_SOURCE_EMC      0x19C
 #define  EMC_2X_CLK_SRC_SHIFT 29
@@ -34,6 +35,9 @@
 #define CLK_RST_CONTROLLER_CLK_ENB_X_CLR       0x288
 #define CLK_RST_CONTROLLER_PLLMB_BASE          0x5E8
 #define CLK_RST_CONTROLLER_CLK_SOURCE_EMC_DLL  0x664
+#define  EMC_DLL_PLLM_VCOB  (1 << 10)
+#define  EMC_DLL_SWITCH_OUT (1 << 11)
+
 #define CLK_RST_CONTROLLER_CLK_SOURCE_EMC_SAFE 0x724
 
 /* Memory controller registers */
@@ -175,7 +179,8 @@
 #define  TIMING_UPDATE_STALLED  (1 << 23)
 #define  MRR_DIVLD              (1 << 20)
 #define  IN_SELF_REFRESH_MASK   (3 << 8)
-#define  IN_POWERDOWN_MASK      (3 << 4)
+#define  IN_POWERDOWN_BOTH_MASK (3 << 4)
+#define  IN_POWERDOWN_1DEV_MASK (1 << 4)
 #define  REQ_FIFO_EMPTY         (1 << 0)
 
 #define EMC_CFG_2                     0x2B8

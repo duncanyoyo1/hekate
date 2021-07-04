@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 CTCaer
+ * Copyright (c) 2019-2021 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -17,9 +17,10 @@
 #ifndef _SEPT_H_
 #define _SEPT_H_
 
-#include "../utils/types.h"
+#include <utils/types.h>
 
-void check_sept();
+#define SEPT_PRI_ENTRY  0x40010340
+
 int reboot_to_sept(const u8 *tsec_fw, u32 kb);
 
 #endif
